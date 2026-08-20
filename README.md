@@ -4,7 +4,7 @@ Xi 是一个使用 Python 实现的通用 Coding Agent Runtime。它通过自然
 并在受限工作区内自主完成代码搜索、文件读取、补丁修改和测试验证。
 
 这个项目关注的不是简单封装大模型 API，而是 Coding Agent 的运行时机制：模型如何与
-工具循环协作，工具调用如何受到权限策略约束，执行过程如何被记录、回放、恢复和分叉，以及
+工具循环协作，工具调用如何受到权限策略约束，执行过程如何被记录、回放、续接、故障恢复和分叉，以及
 不同上下文策略如何通过可重复实验进行比较。
 
 ## 项目定位
@@ -15,7 +15,7 @@ Xi 当前已经具备一个可运行、可研究的最小闭环：
 - 模型、工具、策略、执行器和 JSONL 会话存储都可以替换；
 - 支持代码搜索、文件读取、补丁修改和测试命令执行；
 - 记录可审计的 JSONL 事件 Trace，并支持离线回放；
-- 支持从 Trace 恢复上下文并继续执行；
+- 支持从正常、失败或安全中断的 Trace 恢复上下文并继续执行；
 - 支持从历史成功 Run 的结束事件创建独立 Session 分支；
 - 使用 Session Schema v2 区分稳定的 `session_id` 与每轮独立的 `run_id`；
 - 提供基于证据的完成契约，避免模型只描述修改而没有真正执行；
@@ -66,7 +66,7 @@ xi fork .xi\traces\20260820-120000-abcd1234.jsonl --at-event <run_finished事件
   → 最终结果
 ```
 
-交互模式、一次性任务、Benchmark、Session Resume 和 Session Fork 都复用同一个 `AgentRuntime`，
+交互模式、一次性任务、Benchmark、Session Resume、Recovery 和 Session Fork 都复用同一个 `AgentRuntime`，
 而不是各自维护一套 Agent 循环。
 
 普通任务默认采用宽松完成语义。需要证据驱动完成时，可以明确要求文件改动和指定命令
@@ -155,25 +155,40 @@ Xi 的本地执行器会约束工作目录、文件路径、超时和输出长�
 Headless 模式中，未知命令默认拒绝；固定评测请用 `--allow-command` 精确声明
 唯一测试命令。交互模式会对未知命令询问确认。
 
-## 会话恢复（Session Resume）
+## 会话续接与故障恢复（Resume / Recovery）
 
-正常完成的 trace 可以恢复成模型对话并继续执行。`resume` 默认使用 trace 中记录的
-工作区，并继续向原 JSONL 文件追加事件；新的 `run_started` 会把上一条事件作为
-`parent_id`。同一会话保持稳定的 `session_id`，每次用户输入都会创建独立的
-`run_id`：
+CLI 统一使用 `xi resume`，但会根据 Trace 尾部自动区分两种领域行为：正常完成的
+`run_finished` 属于 Resume；`run_failed` 或安全中断的不完整 Run 属于 Recovery。
+两者都使用 Trace 中记录的工作区、继续向原 JSONL 文件追加事件，并保持原
+`session_id`；新一轮会创建独立 `run_id`，其 `run_started.parent_id` 指向恢复前的
+最后事件：
 
 ```powershell
-# 恢复后进入自然语言交互
+# 续接或故障恢复后进入自然语言交互
 xi resume .xi\traces\20260820-120000-abcd1234.jsonl
 
-# 恢复后只执行一轮
+# 续接或故障恢复后只执行一轮
 xi resume .xi\traces\20260820-120000-abcd1234.jsonl -p "继续完成剩余工作"
 ```
 
-Session Projection 会从事件流中恢复最近一次发送给模型的消息，并合入该轮最终响应。
-旧版 v1 Trace 没有 `session_id` 时，会用其原有 `run_id` 推导会话身份；恢复后新增的
-事件会按 v2 格式继续写入。当前版本只恢复正常完成且保存了
-`model_requested.messages` 的 trace；失败会话和 compaction 留在后续阶段。
+Recovery 只接受可证明安全的持久化检查点：必须存在 `model_requested.messages`，并且
+后续 assistant/tool 交换能够完整重建。已经完成的 assistant tool call 与
+`tool_finished` 结果会作为历史消息交给模型，但 Xi **不会重新执行旧工具调用**。
+如果存在没有对应 `tool_finished` 的 `tool_started`，工具副作用状态不确定，v1 会明确
+拒绝恢复；同一 assistant 响应只有部分工具调用完成时也会拒绝，而不会静默丢弃历史。
+
+Recovery 后首个 `run_started.payload.recovered_from` 会记录来源 Trace、`session_id`、
+`run_id`、尾部 `event_id`、`state`（`failed` 或 `incomplete`）以及用于重建上下文的
+`checkpoint_event_id`；后续正常 Run 不重复写入。旧版 v1 Trace 没有 `session_id` 时，
+仍会用原 `run_id` 推导会话身份，新增事件继续采用 v2 格式。
+
+三种历史操作的区别如下：
+
+| 操作 | 来源状态 | Session 身份 | Trace 与因果链 |
+| --- | --- | --- | --- |
+| Resume | 正常完成的 Run | 保持不变 | 追加原 Trace，延续原 parent 链 |
+| Recovery | 失败或安全中断的 Run | 保持不变 | 追加原 Trace，从安全历史继续且不重放工具 |
+| Fork | 历史成功 Run 的终点 | 创建新身份 | 写入新 Trace，不跨 Trace 建立 parent 链 |
 
 ## 会话分叉（Session Fork）
 
@@ -207,7 +222,7 @@ xi replay .xi\benchmarks\order-total-quantity-001\20260820-085219-19e2a9f3\trace
 ```
 
 Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运行摘要；Fork Trace
-还会显示分支来源。Replay 不会
+会显示分支来源，Recovery Run 会显示恢复来源和安全检查点。Replay 不会
 调用模型、执行工具或命令，也不会修改工作区，因此不是 resume 或重新执行。
 回放会显示会话 ID、运行轮数与各轮连接关系，并检查 JSON 合法性、单一
 `session_id`、唯一 `event_id`，以及按顺序可解析的 `parent_id`。一个 v2 Trace 可包含
@@ -216,7 +231,6 @@ Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运�
 ## 后续路线
 
 - 将 Session Fork 扩展到更多安全的历史节点；
-- 失败或中断会话恢复；
 - 长会话上下文压缩（Compaction）及对应实验；
 - Docker Executor，进一步加强进程与文件系统隔离。
 

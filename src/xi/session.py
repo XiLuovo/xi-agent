@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from .events import (
     Event,
@@ -30,12 +30,21 @@ class SessionProjectionError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveryPoint:
+    """A safe persisted checkpoint for a failed or incomplete Run."""
+
+    state: Literal["failed", "incomplete"]
+    checkpoint_event_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class SessionProjection:
-    """Minimal durable state required to resume or fork a Xi Session.
+    """Minimal durable state required to resume, recover, or fork a Session.
 
     Resume uses ``last_event_id`` as the next ``run_started`` parent in the
-    same Trace. Fork records it as the source endpoint but deliberately starts
-    the new Trace with no parent.
+    same Trace. Recovery does the same from a safe checkpoint and records its
+    source state. Fork records the endpoint but starts a new Trace with no
+    parent.
     """
 
     source: Path
@@ -50,6 +59,7 @@ class SessionProjection:
     # Kept at the end with a default so existing positional construction of
     # the public projection object remains compatible.
     session_id: str = ""
+    recovery: RecoveryPoint | None = None
 
 
 def project_session(
@@ -57,13 +67,14 @@ def project_session(
     *,
     at_event_id: str | None = None,
 ) -> SessionProjection:
-    """Project a successful Run endpoint into reusable model context.
+    """Project a resumable or recoverable Run into reusable model context.
 
     The most recent ``model_requested`` event already contains the canonical
     conversation sent to the model. Projection restores that snapshot and
-    folds in the response that completed the selected turn. ``at_event_id``
-    limits projection to that event and everything before it, which lets Fork
-    inherit historical context without seeing later Runs in the source Trace.
+    folds in any complete response/tool exchange persisted after it.
+    ``at_event_id`` remains the strict Fork path and accepts only a successful
+    ``run_finished`` endpoint. Without it, a failed or safely incomplete tail
+    is projected as Recovery state.
     """
 
     try:
@@ -85,15 +96,19 @@ def project_session(
             raise SessionProjectionError(f"trace 不包含指定 event_id: {at_event_id}")
     selected_events = trace.events[: target_index + 1]
     final_event = selected_events[-1]
-    if (
-        final_event.type != "run_finished"
-        or final_event.payload.get("success", True) is not True
-    ):
-        raise SessionProjectionError("目标事件必须是成功的 run_finished")
+    recovery_state = _classify_endpoint(
+        selected_events,
+        final_event,
+        explicit_event=at_event_id is not None,
+    )
+    if recovery_state is not None:
+        _ensure_no_unfinished_tool_execution(selected_events)
 
     started_events = [event for event in selected_events if event.type == "run_started"]
     if not started_events:
         raise SessionProjectionError("trace 缺少 run_started，无法确定工作区")
+    if started_events[-1].run_id != final_event.run_id:
+        raise SessionProjectionError("trace 尾部不属于最新 Run，无法安全投影")
 
     workspaces: list[Path] = []
     for event in started_events:
@@ -122,33 +137,12 @@ def project_session(
             "trace 未保存 model_requested.messages，无法恢复模型上下文"
         )
 
-    messages = _normalize_messages(raw_messages)
-    response_seen = False
-    for event in selected_events[request_index + 1 :]:
-        if event.run_id != final_event.run_id:
-            continue
-        payload = event.payload
-        if event.type == "model_responded" and not response_seen:
-            messages.append(_assistant_message(payload))
-            response_seen = True
-        elif event.type == "tool_finished" and response_seen:
-            call_id = payload.get("call_id")
-            if isinstance(call_id, str) and call_id:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": _tool_message(payload),
-                    }
-                )
-        elif event.type == "completion_decided" and payload.get("accepted") is False:
-            feedback = payload.get("feedback")
-            if not isinstance(feedback, str) or not feedback:
-                feedback = _completion_feedback(payload.get("missing"))
-            messages.append({"role": "user", "content": feedback})
-
-    if not response_seen:
-        raise SessionProjectionError("trace 缺少完成当前轮次的 model_responded 事件")
+    messages = _project_messages_from_checkpoint(
+        selected_events,
+        request_index=request_index,
+        run_id=final_event.run_id,
+        require_response=recovery_state is None,
+    )
 
     target_started_events = [
         event for event in started_events if event.run_id == final_event.run_id
@@ -168,7 +162,225 @@ def project_session(
         last_event_id=final_event.event_id,
         context_strategy=context_strategy.strip(),
         turns=len(started_events),
+        recovery=(
+            RecoveryPoint(
+                state=recovery_state,
+                checkpoint_event_id=selected_events[request_index].event_id,
+            )
+            if recovery_state is not None
+            else None
+        ),
     )
+
+
+def _classify_endpoint(
+    events: tuple[Event, ...],
+    final_event: Event,
+    *,
+    explicit_event: bool,
+) -> Literal["failed", "incomplete"] | None:
+    if final_event.type == "run_finished":
+        if final_event.payload.get("success", True) is True:
+            return None
+        raise SessionProjectionError("目标 run_finished 未成功，无法安全续接")
+    if explicit_event:
+        raise SessionProjectionError("目标事件必须是成功的 run_finished")
+
+    target_run_events = [event for event in events if event.run_id == final_event.run_id]
+    earlier_terminal = any(
+        event.type in {"run_finished", "run_failed"}
+        for event in target_run_events[:-1]
+    )
+    if earlier_terminal:
+        raise SessionProjectionError("最新 Run 的终止事件后仍有事件，无法安全恢复")
+    if final_event.type == "run_failed":
+        return "failed"
+    return "incomplete"
+
+
+def _ensure_no_unfinished_tool_execution(events: tuple[Event, ...]) -> None:
+    started: dict[str, Event] = {}
+    for event in events:
+        if event.type == "tool_started":
+            started[event.event_id] = event
+
+    finished_started_ids: set[str] = set()
+    for event in events:
+        if event.type != "tool_finished" or event.parent_id not in started:
+            continue
+        started_event = started[event.parent_id]
+        started_call_id = started_event.payload.get("call_id")
+        finished_call_id = event.payload.get("call_id")
+        if (
+            event.run_id != started_event.run_id
+            or not isinstance(started_call_id, str)
+            or not started_call_id
+            or finished_call_id != started_call_id
+        ):
+            raise SessionProjectionError(
+                "tool_started 与 tool_finished 的 Run 或 call_id 不一致，拒绝恢复"
+            )
+        if event.parent_id in finished_started_ids:
+            raise SessionProjectionError(
+                f"同一 tool_started 对应多个 tool_finished: {event.parent_id}"
+            )
+        finished_started_ids.add(event.parent_id)
+
+    unresolved = [
+        event
+        for event_id, event in started.items()
+        if event_id not in finished_started_ids
+    ]
+    if not unresolved:
+        return
+    event = unresolved[0]
+    call_id = event.payload.get("call_id")
+    call_text = call_id if isinstance(call_id, str) and call_id else "<unknown>"
+    raise SessionProjectionError(
+        "检测到 tool_started 缺少对应 tool_finished，工具副作用状态不确定；"
+        f"拒绝恢复 call_id={call_text} event_id={event.event_id}"
+    )
+
+
+def _project_messages_from_checkpoint(
+    events: tuple[Event, ...],
+    *,
+    request_index: int,
+    run_id: str,
+    require_response: bool,
+) -> list[dict[str, Any]]:
+    raw_messages = events[request_index].payload.get("messages")
+    if not isinstance(raw_messages, list):
+        raise SessionProjectionError(
+            "安全检查点缺少 model_requested.messages，无法恢复模型上下文"
+        )
+    messages = _normalize_messages(raw_messages)
+    tail = [event for event in events[request_index + 1 :] if event.run_id == run_id]
+    responses = [event for event in tail if event.type == "model_responded"]
+    if len(responses) > 1:
+        raise SessionProjectionError("安全检查点之后包含多个 model_responded，无法确定上下文")
+    if not responses:
+        if any(
+            event.type
+            in {
+                "tool_proposed",
+                "policy_decided",
+                "approval_requested",
+                "tool_started",
+                "tool_finished",
+                "file_changed",
+            }
+            for event in tail
+        ):
+            raise SessionProjectionError(
+                "安全检查点后的工具事件缺少对应 model_responded，无法恢复上下文"
+            )
+        if require_response:
+            raise SessionProjectionError("trace 缺少完成当前轮次的 model_responded 事件")
+        return messages
+
+    response = responses[0]
+    response_index = tail.index(response)
+    if any(
+        event.type
+        in {
+            "tool_proposed",
+            "policy_decided",
+            "approval_requested",
+            "tool_started",
+            "tool_finished",
+            "file_changed",
+            "completion_decided",
+        }
+        for event in tail[:response_index]
+    ):
+        raise SessionProjectionError("model_responded 之前出现了无法归属的工具或完成事件")
+    after_response = tail[response_index + 1 :]
+    call_ids = _response_tool_call_ids(response.payload)
+    finished_by_call: dict[str, Event] = {}
+    for event in after_response:
+        if event.type != "tool_finished":
+            continue
+        call_id = event.payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise SessionProjectionError("tool_finished 缺少有效 call_id，无法恢复上下文")
+        if call_id in finished_by_call:
+            raise SessionProjectionError(f"tool_finished call_id 重复: {call_id}")
+        finished_by_call[call_id] = event
+
+    finished_event_ids = {event.event_id for event in finished_by_call.values()}
+    if any(
+        event.type == "file_changed" and event.parent_id not in finished_event_ids
+        for event in after_response
+    ):
+        raise SessionProjectionError("file_changed 未指向已完成的 tool_finished，拒绝恢复")
+
+    unexpected_finished = set(finished_by_call).difference(call_ids)
+    if unexpected_finished:
+        call_id = sorted(unexpected_finished)[0]
+        raise SessionProjectionError(
+            f"tool_finished 未对应安全检查点后的 assistant tool_call: {call_id}"
+        )
+
+    if call_ids:
+        completed = [call_id for call_id in call_ids if call_id in finished_by_call]
+        if not completed:
+            # The assistant proposed tools, but no execution completed and the
+            # unfinished-start check proved that no side effect is in flight.
+            # Roll back to the persisted request snapshot instead of inventing
+            # tool results or replaying the proposal.
+            return messages
+        if len(completed) != len(call_ids):
+            raise SessionProjectionError(
+                "同一 assistant 响应的工具调用仅部分完成；"
+                "无法在保留已完成副作用的同时构造合法模型上下文"
+            )
+        messages.append(_assistant_message(response.payload))
+        for call_id in call_ids:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": _tool_message(finished_by_call[call_id].payload),
+                }
+            )
+    else:
+        if finished_by_call:
+            raise SessionProjectionError("assistant 未声明工具调用，但 trace 包含 tool_finished")
+        messages.append(_assistant_message(response.payload))
+
+    for event in after_response:
+        payload = event.payload
+        if event.type != "completion_decided" or payload.get("accepted") is not False:
+            continue
+        feedback = payload.get("feedback")
+        if not isinstance(feedback, str) or not feedback:
+            feedback = _completion_feedback(payload.get("missing"))
+        messages.append({"role": "user", "content": feedback})
+    return messages
+
+
+def _response_tool_call_ids(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_calls = payload.get("tool_calls") or []
+    if not isinstance(raw_calls, list):
+        raise SessionProjectionError("model_responded.tool_calls 必须是列表")
+    call_ids: list[str] = []
+    for index, item in enumerate(raw_calls, start=1):
+        if not isinstance(item, Mapping):
+            raise SessionProjectionError(f"tool_calls 第 {index} 项不是对象")
+        call_id = item.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            raise SessionProjectionError(f"tool_calls 第 {index} 项缺少有效 id")
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            raise SessionProjectionError(f"tool_calls 第 {index} 项缺少有效 name")
+        arguments = item.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            raise SessionProjectionError(f"tool_calls 第 {index} 项 arguments 不是对象")
+        if call_id in call_ids:
+            raise SessionProjectionError(f"assistant tool_call id 重复: {call_id}")
+        call_ids.append(call_id)
+    return tuple(call_ids)
 
 
 def _normalize_messages(value: list[Any]) -> list[dict[str, Any]]:
@@ -257,6 +469,7 @@ __all__ = [
     "JsonlSessionStore",
     "MemoryStore",
     "JsonlStore",
+    "RecoveryPoint",
     "SessionProjection",
     "SessionProjectionError",
     "project_session",

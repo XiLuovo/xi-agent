@@ -2,7 +2,7 @@
 
 Replay 只把已经存在的事件投影成一条人类可读的时间线。它不创建
 ``AgentRuntime``，不加载模型，不实例化执行器，也不会向 trace 或工作区写入
-任何内容；因此它和 resume/重新执行是有意不同的能力。
+任何内容；因此它和 resume、recovery 或重新执行是有意不同的能力。
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ class ReplaySummary:
     run_ids: tuple[str, ...] = ()
     run_count: int = 0
     forked_from: dict[str, str] | None = None
+    recovered_from: dict[str, str] | None = None
 
     @property
     def runs(self) -> int:
@@ -173,6 +174,20 @@ def render_trace(trace: ReplayTrace, *, max_text: int = 180) -> str:
                 f"  event_id: {_clip(origin.get('event_id', ''), limit)}",
             ]
         )
+    if summary.recovered_from:
+        origin = summary.recovered_from
+        lines.extend(
+            [
+                "最近恢复来源:",
+                f"  trace: {_clip(origin.get('trace', ''), limit)}",
+                f"  session_id: {_clip(origin.get('session_id', ''), limit)}",
+                f"  run_id: {_clip(origin.get('run_id', ''), limit)}",
+                f"  event_id: {_clip(origin.get('event_id', ''), limit)}",
+                f"  state: {_clip(origin.get('state', ''), limit)}",
+                "  checkpoint_event_id: "
+                f"{_clip(origin.get('checkpoint_event_id', ''), limit)}",
+            ]
+        )
     lines.extend(["", "时间线:"])
     first_time = _parse_timestamp(trace.events[0].timestamp)
     for event in trace.events:
@@ -281,6 +296,7 @@ def _summarize(
     final_text = ""
     error: str | None = None
     forked_from: dict[str, str] | None = None
+    recovered_from: dict[str, str] | None = None
 
     for event in events:
         payload = event.payload
@@ -290,6 +306,9 @@ def _summarize(
             run_steps.append(0)
             if forked_from is None:
                 forked_from = _normalize_fork_origin(payload.get("forked_from"))
+            recovery_origin = _normalize_recovery_origin(payload.get("recovered_from"))
+            if recovery_origin is not None:
+                recovered_from = recovery_origin
             event_task = _as_text(payload.get("task"))
             if event_task:
                 task = event_task
@@ -366,6 +385,7 @@ def _summarize(
         run_ids=run_ids,
         run_count=run_count,
         forked_from=forked_from,
+        recovered_from=recovered_from,
     )
 
 
@@ -385,6 +405,16 @@ def _event_line(event: Event, limit: int) -> str:
                 f"{_clip(origin.get('session_id', ''), 12)}/"
                 f"{_clip(origin.get('run_id', ''), 12)}/"
                 f"{_clip(origin.get('event_id', ''), 12)}"
+            )
+        recovery_origin = _normalize_recovery_origin(payload.get("recovered_from"))
+        if recovery_origin:
+            line += (
+                " recovered_from="
+                f"{_clip(recovery_origin.get('state', ''), 10)}:"
+                f"{_clip(recovery_origin.get('run_id', ''), 12)}/"
+                f"{_clip(recovery_origin.get('event_id', ''), 12)}"
+                " checkpoint="
+                f"{_clip(recovery_origin.get('checkpoint_event_id', ''), 12)}"
             )
         return line
     if event_type == "model_requested":
@@ -487,6 +517,21 @@ def _normalize_fork_origin(value: Any) -> dict[str, str] | None:
     if not isinstance(value, Mapping):
         return None
     keys = ("trace", "session_id", "run_id", "event_id")
+    origin = {key: _as_text(value.get(key)) for key in keys}
+    return origin if all(origin.values()) else None
+
+
+def _normalize_recovery_origin(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    keys = (
+        "trace",
+        "session_id",
+        "run_id",
+        "event_id",
+        "state",
+        "checkpoint_event_id",
+    )
     origin = {key: _as_text(value.get(key)) for key in keys}
     return origin if all(origin.values()) else None
 

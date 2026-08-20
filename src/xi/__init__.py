@@ -18,12 +18,13 @@ from .context import ContextBuilder, RepoMapContextBuilder, SearchContextBuilder
 from .events import Event, EventCollection, JsonlSessionStore, MemorySessionStore
 from .models import ModelResponse, OpenAICompatibleModel, OpenAIModel, ScriptedModel, ToolCall
 from .runtime import AgentRuntime, RunResult
-from .session import SessionProjection, SessionProjectionError, project_session
+from .session import RecoveryPoint, SessionProjection, SessionProjectionError, project_session
 
 __all__ = [
     "__version__",
     "AgentRuntime",
     "RunResult",
+    "RecoveryPoint",
     "SessionProjection",
     "SessionProjectionError",
     "project_session",

@@ -97,6 +97,7 @@ class AgentRuntime:
         self._session_id = session_id or uuid4().hex
         self._session_parent_id: str | None = None
         self._forked_from: dict[str, str] | None = None
+        self._recovered_from: dict[str, str] | None = None
 
     @property
     def conversation(self) -> list[dict[str, Any]]:
@@ -130,6 +131,18 @@ class AgentRuntime:
         self._session_id = projection.session_id or projection.run_id
         self._session_parent_id = projection.last_event_id
         self._forked_from = None
+        self._recovered_from = (
+            {
+                "trace": str(projection.source),
+                "session_id": projection.session_id or projection.run_id,
+                "run_id": projection.run_id,
+                "event_id": projection.last_event_id,
+                "state": projection.recovery.state,
+                "checkpoint_event_id": projection.recovery.checkpoint_event_id,
+            }
+            if projection.recovery is not None
+            else None
+        )
 
     def fork_session(self, projection: SessionProjection) -> None:
         """Seed a new Session from historical context in another Trace.
@@ -149,6 +162,7 @@ class AgentRuntime:
         self._conversation = deepcopy(list(projection.messages))
         self._session_id = uuid4().hex
         self._session_parent_id = None
+        self._recovered_from = None
         self._forked_from = {
             "trace": str(projection.source),
             "session_id": projection.session_id or projection.run_id,
@@ -182,9 +196,10 @@ class AgentRuntime:
         approve = approval_callback or self.approval_callback
         is_session_run = bool(continue_session)
         forked_from = deepcopy(self._forked_from)
+        recovered_from = deepcopy(self._recovered_from)
         is_fork_run = forked_from is not None
-        # Every user turn is a distinct Run. Resume reuses the Session identity
-        # and prior event; the first Fork Run instead starts a new causal root.
+        # Every user turn is a distinct Run. Resume/Recovery reuse the Session
+        # identity and prior event; the first Fork Run starts a new causal root.
         run_id = uuid4().hex
         session_parent_id = self._session_parent_id if is_session_run else None
         run_events: list[Event] = []
@@ -243,6 +258,8 @@ class AgentRuntime:
         }
         if forked_from is not None:
             started_payload["forked_from"] = forked_from
+        if recovered_from is not None:
+            started_payload["recovered_from"] = recovered_from
         started = emit(
             "run_started",
             started_payload,
@@ -250,6 +267,8 @@ class AgentRuntime:
         )
         if is_fork_run:
             self._forked_from = None
+        if recovered_from is not None:
+            self._recovered_from = None
 
         if context_error is not None:
             return self._failed(
