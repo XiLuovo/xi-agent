@@ -1,0 +1,60 @@
+[
+  {
+    "tool_calls": [
+      {
+        "id": "search-retry-parser",
+        "name": "search_code",
+        "arguments": {
+          "query": "parse_retry_limit"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "read-settings",
+        "name": "read_file",
+        "arguments": {
+          "path": "settings.py"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "read-settings-test",
+        "name": "read_file",
+        "arguments": {
+          "path": "test_settings.py"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "fix-error-contract",
+        "name": "apply_patch",
+        "arguments": {
+          "patch": "*** Begin Patch\n*** Update File: settings.py\n@@\n-    try:\n-        value = int(raw[\"retry_limit\"])\n-    except (KeyError, TypeError, ValueError):\n-        return 0\n+    try:\n+        raw_value = raw[\"retry_limit\"]\n+    except KeyError as exc:\n+        raise SettingsError(\"missing retry_limit\") from exc\n+    try:\n+        value = int(raw_value)\n+    except (TypeError, ValueError) as exc:\n+        raise SettingsError(\"retry_limit must be an integer\") from exc\n     if value < 0:\n-        return 0\n+        raise SettingsError(\"retry_limit must be non-negative\")\n     return value\n*** End Patch"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "verify-error-contract",
+        "name": "run_command",
+        "arguments": {
+          "command": "{{TEST_COMMAND}}"
+        }
+      }
+    ]
+  },
+  {
+    "text": "已将被吞掉的配置错误映射为明确的 SettingsError 契约，并通过固定测试验证。"
+  }
+]

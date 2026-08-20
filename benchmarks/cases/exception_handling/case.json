@@ -1,0 +1,15 @@
+{
+  "id": "exception-handling-001",
+  "title": "配置解析吞掉错误状态",
+  "task": "修复 retry_limit 配置解析吞掉错误并返回 0 的问题。请先搜索并阅读实现和测试，按测试中的明确异常契约区分缺失、类型错误和负数，只修改 settings.py，不要修改测试或 AGENTS.md。完成后使用以下命令验证：{{TEST_COMMAND}}",
+  "test_file": "test_settings.py",
+  "protected_paths": [
+    "test_settings.py",
+    "AGENTS.md"
+  ],
+  "allowed_changed_paths": [
+    "settings.py"
+  ],
+  "max_steps": 12,
+  "max_duration_seconds": 120
+}

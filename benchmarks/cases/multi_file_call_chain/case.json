@@ -1,0 +1,15 @@
+{
+  "id": "multi-file-call-chain-001",
+  "title": "结账调用链忽略顾客等级",
+  "task": "修复 VIP 结账摘要未应用折扣的问题。错误表现在 checkout.py 的最终摘要中，请通过搜索和阅读跟踪跨文件调用链，定位真正根因；最终只修改 pricing.py，不要修改其他产品文件、测试或 AGENTS.md。完成后使用以下命令验证：{{TEST_COMMAND}}",
+  "test_file": "test_checkout.py",
+  "protected_paths": [
+    "test_checkout.py",
+    "AGENTS.md"
+  ],
+  "allowed_changed_paths": [
+    "pricing.py"
+  ],
+  "max_steps": 12,
+  "max_duration_seconds": 120
+}

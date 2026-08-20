@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "core",
+  "title": "Xi Core Benchmark Suite",
+  "description": "覆盖单文件逻辑、边界条件、跨文件调用链、异常契约和返回结构契约。",
+  "cases": [
+    "order_total_quantity",
+    "boundary_condition",
+    "multi_file_call_chain",
+    "exception_handling",
+    "api_contract"
+  ]
+}

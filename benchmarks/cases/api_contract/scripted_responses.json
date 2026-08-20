@@ -1,0 +1,93 @@
+[
+  {
+    "tool_calls": [
+      {
+        "id": "search-profile-consumer",
+        "name": "search_code",
+        "arguments": {
+          "query": "render_profile"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "read-profile-consumer",
+        "name": "read_file",
+        "arguments": {
+          "path": "profile_view.py"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "search-profile-provider",
+        "name": "search_code",
+        "arguments": {
+          "query": "def get_profile"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "read-profile-provider",
+        "name": "read_file",
+        "arguments": {
+          "path": "profile_service.py"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "read-profile-repository",
+        "name": "read_file",
+        "arguments": {
+          "path": "profile_repository.py"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "read-profile-test",
+        "name": "read_file",
+        "arguments": {
+          "path": "test_profile_contract.py"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "fix-profile-contract",
+        "name": "apply_patch",
+        "arguments": {
+          "patch": "*** Begin Patch\n*** Update File: profile_service.py\n@@\n     record = fetch_user(user_id)\n     return {\n-        \"user_id\": record[\"user_id\"],\n-        \"display_name\": record[\"full_name\"],\n-        \"active\": \"yes\" if record[\"enabled\"] else \"no\",\n+        \"id\": record[\"user_id\"],\n+        \"name\": record[\"full_name\"],\n+        \"active\": bool(record[\"enabled\"]),\n     }\n*** End Patch"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "verify-profile-contract",
+        "name": "run_command",
+        "arguments": {
+          "command": "{{TEST_COMMAND}}"
+        }
+      }
+    ]
+  },
+  {
+    "text": "已根据消费方契约修正 profile_service.py 的字段名和 active 布尔类型，并通过固定测试验证。"
+  }
+]

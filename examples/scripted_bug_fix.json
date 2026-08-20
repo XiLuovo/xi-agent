@@ -1,0 +1,32 @@
+[
+  {
+    "tool_calls": [
+      {
+        "id": "search-1",
+        "name": "search_code",
+        "arguments": {"query": "return a - b"}
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "read-1",
+        "name": "read_file",
+        "arguments": {"path": "calculator.py"}
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "id": "patch-1",
+        "name": "apply_patch",
+        "arguments": {
+          "patch": "*** Begin Patch\n*** Update File: calculator.py\n@@\n def add(a, b):\n-    return a - b\n+    return a + b\n*** End Patch"
+        }
+      }
+    ]
+  },
+  {"text": "已修复；请运行测试确认。"}
+]
