@@ -17,6 +17,7 @@ Xi 当前已经具备一个可运行、可研究的最小闭环：
 - 记录可审计的 JSONL 事件 Trace，并支持离线回放；
 - 支持从正常、失败或安全中断的 Trace 恢复上下文并继续执行；
 - 支持从历史成功 Run 的结束事件创建独立 Session 分支；
+- 支持可回放、可恢复的确定性长会话上下文压缩；
 - 使用 Session Schema v2 区分稳定的 `session_id` 与每轮独立的 `run_id`；
 - 提供基于证据的完成契约，避免模型只描述修改而没有真正执行；
 - 提供 `search` 与 `repo-map` 两种上下文策略和可重复 Benchmark。
@@ -50,6 +51,7 @@ xi resume .xi\traces\20260820-120000-abcd1234.jsonl
 xi resume .xi\traces\20260820-120000-abcd1234.jsonl -p "继续检查刚才的修改"
 xi fork .xi\traces\20260820-120000-abcd1234.jsonl --at-event <run_finished事件ID>
 xi fork .xi\traces\20260820-120000-abcd1234.jsonl --at-event <run_finished事件ID> -p "尝试另一种方案"
+xi -p "处理较长任务" --context-budget-chars 8000
 ```
 
 ## 核心运行流程
@@ -190,6 +192,29 @@ Recovery 后首个 `run_started.payload.recovered_from` 会记录来源 Trace、
 | Recovery | 失败或安全中断的 Run | 保持不变 | 追加原 Trace，从安全历史继续且不重放工具 |
 | Fork | 历史成功 Run 的终点 | 创建新身份 | 写入新 Trace，不跨 Trace 建立 parent 链 |
 
+## 上下文压缩（Compaction）
+
+上下文压缩默认关闭。需要为长会话设置显式预算时，使用
+`--context-budget-chars`；单位是稳定、可解释的 JSON 字符数，**不是 token 计数**：
+
+```powershell
+xi -p "处理长会话任务" --context-budget-chars 8000
+xi resume .xi\traces\long-session.jsonl -p "继续" --context-budget-chars 10000
+```
+
+Xi 使用本地确定性压缩器，不调用额外模型，也不需要 API Key。压缩仅发生在下一次
+模型请求之前，并且必须位于完整模型响应及其所有工具结果都已落盘的安全检查点；不会
+在 `tool_started` 与 `tool_finished` 之间压缩。首个 system 指令、当前任务意图和
+可容纳的最近完整对话会保留，较旧消息会形成明确标记的历史摘要；assistant tool call
+与对应 tool 结果不会被拆成非法消息。
+
+每次压缩都追加一条 `context_compacted` 事件，包含预算、压缩前后消息数与字符数，以及
+压缩后的完整模型消息快照。原始 Trace 事件不会被覆盖或删除，因此 Replay 仍能观察
+完整历史。Resume、Recovery 和 Fork 都能继承最近的压缩检查点；Recovery 只恢复模型
+上下文，绝不会重新执行已经完成的工具副作用。未显式传入新预算时，Resume/Fork 沿用
+来源 Trace 记录的预算；显式参数会覆盖该轮预算。预算小到无法保留最小合法上下文时，
+Xi 会明确失败，而不是静默丢弃 system 指令。
+
 ## 会话分叉（Session Fork）
 
 `fork` 从历史成功 Run 的 `run_finished` 事件创建独立分支。它只继承目标事件及其
@@ -222,7 +247,8 @@ xi replay .xi\benchmarks\order-total-quantity-001\20260820-085219-19e2a9f3\trace
 ```
 
 Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运行摘要；Fork Trace
-会显示分支来源，Recovery Run 会显示恢复来源和安全检查点。Replay 不会
+会显示分支来源，Recovery Run 会显示恢复来源和安全检查点，压缩 Trace 会显示
+`context_compacted` 时间线与压缩次数、预算和前后字符数。Replay 不会
 调用模型、执行工具或命令，也不会修改工作区，因此不是 resume 或重新执行。
 回放会显示会话 ID、运行轮数与各轮连接关系，并检查 JSON 合法性、单一
 `session_id`、唯一 `event_id`，以及按顺序可解析的 `parent_id`。一个 v2 Trace 可包含
@@ -231,7 +257,7 @@ Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运�
 ## 后续路线
 
 - 将 Session Fork 扩展到更多安全的历史节点；
-- 长会话上下文压缩（Compaction）及对应实验；
+- 长会话上下文压缩策略与预算效果实验；
 - Docker Executor，进一步加强进程与文件系统隔离。
 
 ## 许可证

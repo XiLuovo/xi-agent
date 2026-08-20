@@ -37,3 +37,14 @@ _避免使用_: resume、replay、rerun
 从历史成功 Run 的终点继承截至该点的对话语境，并创建独立的 Session 谱系。新谱系
 保留来源关系，但身份与因果链不属于来源 Trace。
 _避免使用_: resume、replay、rerun
+
+**Compaction（上下文压缩）**:
+在保留 Session 历史事实的前提下，把较旧的模型对话投影为更小、仍可解释的语境，
+以便同一 Session 继续运行。Compaction 改变的是后续模型看到的语境表示，不删除
+Event，也不重新发生任何历史行动。
+_避免使用_: delete、replay、rerun
+
+**Compaction Checkpoint（压缩检查点）**:
+一次 Compaction 产生并持久化的完整模型语境快照。它是后续续接、故障恢复或分叉
+可以继承的历史点，同时保留其对应的原始 Event 谱系。
+_避免使用_: summary、terminal event、tool result

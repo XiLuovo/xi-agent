@@ -16,6 +16,11 @@ from .completion import (
     ToolExecutionEvidence,
     evidence_from_executions,
 )
+from .compaction import (
+    CompactionError,
+    ContextCompactor,
+    DeterministicCompactor,
+)
 from .context import ContextBuilder, SearchContextBuilder
 from .events import Event, JsonlSessionStore, SessionStore
 from .executor import RestrictedLocalExecutor
@@ -63,6 +68,8 @@ class AgentRuntime:
         approval_callback: Callable[[str, Mapping[str, Any], PolicyDecision], bool] | None = None,
         max_observation_chars: int = 12_000,
         session_id: str | None = None,
+        context_budget_chars: int | None = None,
+        compactor: ContextCompactor | None = None,
     ) -> None:
         self.model = model
         self.workspace = Path(workspace).expanduser().resolve()
@@ -93,11 +100,25 @@ class AgentRuntime:
         self.auto_approve = auto_approve
         self.approval_callback = approval_callback
         self.max_observation_chars = max(int(max_observation_chars), 256)
+        if context_budget_chars is not None:
+            if isinstance(context_budget_chars, bool):
+                raise ValueError("context_budget_chars 必须是正整数")
+            try:
+                configured_budget = int(context_budget_chars)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("context_budget_chars 必须是正整数") from exc
+            if configured_budget <= 0:
+                raise ValueError("context_budget_chars 必须是正整数")
+            self.context_budget_chars: int | None = configured_budget
+        else:
+            self.context_budget_chars = None
+        self.compactor = compactor if compactor is not None else DeterministicCompactor()
         self._conversation: list[dict[str, Any]] = []
         self._session_id = session_id or uuid4().hex
         self._session_parent_id: str | None = None
         self._forked_from: dict[str, str] | None = None
         self._recovered_from: dict[str, str] | None = None
+        self._last_compaction_fingerprint: str | None = None
 
     @property
     def conversation(self) -> list[dict[str, Any]]:
@@ -111,6 +132,7 @@ class AgentRuntime:
 
     def reset_conversation(self) -> None:
         self._conversation.clear()
+        self._last_compaction_fingerprint = None
 
     def restore_session(self, projection: SessionProjection) -> None:
         """Restore conversation and lineage from the current session store.
@@ -131,6 +153,7 @@ class AgentRuntime:
         self._session_id = projection.session_id or projection.run_id
         self._session_parent_id = projection.last_event_id
         self._forked_from = None
+        self._last_compaction_fingerprint = _messages_fingerprint(self._conversation)
         self._recovered_from = (
             {
                 "trace": str(projection.source),
@@ -163,6 +186,7 @@ class AgentRuntime:
         self._session_id = uuid4().hex
         self._session_parent_id = None
         self._recovered_from = None
+        self._last_compaction_fingerprint = _messages_fingerprint(self._conversation)
         self._forked_from = {
             "trace": str(projection.source),
             "session_id": projection.session_id or projection.run_id,
@@ -260,6 +284,8 @@ class AgentRuntime:
             started_payload["forked_from"] = forked_from
         if recovered_from is not None:
             started_payload["recovered_from"] = recovered_from
+        if self.context_budget_chars is not None:
+            started_payload["context_budget_chars"] = self.context_budget_chars
         started = emit(
             "run_started",
             started_payload,
@@ -304,6 +330,52 @@ class AgentRuntime:
                         continue_session=is_session_run,
                         messages=messages,
                     )
+                if self.context_budget_chars is not None:
+                    current_fingerprint = _messages_fingerprint(messages)
+                    if current_fingerprint != self._last_compaction_fingerprint:
+                        try:
+                            compaction = self.compactor.compact(
+                                messages,
+                                self.context_budget_chars,
+                            )
+                        except CompactionError as exc:
+                            return self._failed(
+                                emit,
+                                run_events,
+                                run_id,
+                                task,
+                                step - 1,
+                                f"上下文压缩失败: {exc}",
+                                parent_id=turn_parent_id,
+                                continue_session=is_session_run,
+                                messages=messages,
+                            )
+                        if compaction.before_characters > self.context_budget_chars:
+                            compacted_event = emit(
+                                "context_compacted",
+                                {
+                                    "strategy": compaction.strategy,
+                                    "budget_chars": self.context_budget_chars,
+                                    "before_message_count": compaction.before_message_count,
+                                    "after_message_count": compaction.after_message_count,
+                                    "before_characters": compaction.before_characters,
+                                    "after_characters": compaction.after_characters,
+                                    "dropped_message_count": compaction.dropped_message_count,
+                                    "messages": _json_safe(
+                                        [dict(message) for message in compaction.messages]
+                                    ),
+                                    "summary": compaction.summary,
+                                },
+                                parent_id=turn_parent_id,
+                            )
+                            messages = [dict(message) for message in compaction.messages]
+                            turn_parent_id = compacted_event.event_id
+                            self._last_compaction_fingerprint = _messages_fingerprint(messages)
+                        else:
+                            # The compactor may be called for an under-budget
+                            # context; remember the snapshot so an unchanged
+                            # context is not reconsidered on the next iteration.
+                            self._last_compaction_fingerprint = current_fingerprint
                 request_event = emit(
                     "model_requested",
                     {
@@ -491,13 +563,17 @@ class AgentRuntime:
                             _tool_payload(call, result, step),
                             parent_id=started_tool.event_id,
                         )
+                        turn_parent_id = finished_tool.event_id
                         for changed in result.files_changed:
-                            emit(
+                            changed_event = emit(
                                 "file_changed",
                                 {"call_id": call.id, "tool": call.name, "path": changed},
                                 parent_id=finished_tool.event_id,
                             )
-                    turn_parent_id = finished_tool.event_id
+                            if self.context_budget_chars is not None:
+                                turn_parent_id = changed_event.event_id
+                    if decision.decision is Decision.DENY:
+                        turn_parent_id = finished_tool.event_id
                     execution_evidence.append(
                         ToolExecutionEvidence(
                             tool=call.name,
@@ -647,6 +723,18 @@ def _json_safe(value: Any) -> Any:
         if isinstance(value, (list, tuple)):
             return [_json_safe(item) for item in value]
         return str(value)
+
+
+def _messages_fingerprint(messages: Sequence[Mapping[str, Any]]) -> str:
+    """Stable identity used to avoid compacting an unchanged context twice."""
+
+    return json.dumps(
+        [dict(message) for message in messages],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _merge_usage(total: dict[str, Any], current: Mapping[str, Any]) -> None:

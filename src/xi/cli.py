@@ -130,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="search",
         help="上下文策略：search 按需搜索；repo-map 预先提供受限仓库地图",
     )
+    parser.add_argument(
+        "--context-budget-chars",
+        type=int,
+        help="显式启用上下文压缩的字符预算；默认关闭（不是 token 计数）",
+    )
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--max-duration", type=float, default=300.0)
     parser.add_argument("--model-timeout", type=float, default=60.0)
@@ -163,6 +168,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.json = args.json or args.jsonl
+    if args.context_budget_chars is not None and args.context_budget_chars <= 0:
+        parser.error("--context-budget-chars 必须是正整数")
     if args.command != "fork" and args.at_event is not None:
         parser.error("--at-event 仅用于 xi fork")
     if args.command == "replay":
@@ -221,6 +228,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 command_timeout_seconds=args.command_timeout,
             )
         context_strategy = projection.context_strategy if projection is not None else args.context_strategy
+        context_budget_chars = (
+            args.context_budget_chars
+            if args.context_budget_chars is not None
+            else (projection.context_budget_chars if projection is not None else None)
+        )
         runtime = AgentRuntime(
             model,
             workspace=workspace,
@@ -245,6 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             interactive=prompt is None,
             auto_approve=args.auto_approve,
             approval_callback=_approval_prompt,
+            context_budget_chars=context_budget_chars,
         )
         if session_action == "resume" and projection is not None:
             runtime.restore_session(projection)

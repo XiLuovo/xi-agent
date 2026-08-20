@@ -42,6 +42,10 @@ class ReplaySummary:
     run_count: int = 0
     forked_from: dict[str, str] | None = None
     recovered_from: dict[str, str] | None = None
+    compactions: int = 0
+    compaction_budget_chars: int | None = None
+    compaction_before_characters: int = 0
+    compaction_after_characters: int = 0
 
     @property
     def runs(self) -> int:
@@ -205,8 +209,20 @@ def render_trace(trace: ReplayTrace, *, max_text: int = 180) -> str:
             f"  工具调用: {_format_counts(summary.tool_calls)}",
             f"  策略决策: {_format_counts(summary.policy_decisions)}",
             f"  改动文件: {_format_files(summary.changed_files, limit)}",
+            f"  上下文压缩: {summary.compactions} 次",
         ]
     )
+    if summary.compactions:
+        lines.append(
+            "  最近压缩规模: "
+            f"{summary.compaction_before_characters} → "
+            f"{summary.compaction_after_characters} 字符"
+            + (
+                f"（预算 {summary.compaction_budget_chars}）"
+                if summary.compaction_budget_chars is not None
+                else ""
+            )
+        )
     if summary.final_text:
         lines.append(f"  最终消息: {_clip(summary.final_text, limit)}")
     if summary.error:
@@ -297,6 +313,10 @@ def _summarize(
     error: str | None = None
     forked_from: dict[str, str] | None = None
     recovered_from: dict[str, str] | None = None
+    compactions = 0
+    compaction_budget_chars: int | None = None
+    compaction_before_characters = 0
+    compaction_after_characters = 0
 
     for event in events:
         payload = event.payload
@@ -354,6 +374,17 @@ def _summarize(
         elif event.type == "model_responded" and not final_text:
             # Useful for incomplete traces that ended after a model response.
             final_text = _as_text(payload.get("text"))
+        elif event.type == "context_compacted":
+            compactions += 1
+            budget = _as_nonnegative_int(payload.get("budget_chars"))
+            if budget is not None:
+                compaction_budget_chars = budget
+            compaction_before_characters = _as_nonnegative_int(
+                payload.get("before_characters")
+            ) or 0
+            compaction_after_characters = _as_nonnegative_int(
+                payload.get("after_characters")
+            ) or 0
 
     steps = sum(run_steps)
     run_count = len(run_steps) or 1
@@ -386,6 +417,10 @@ def _summarize(
         run_count=run_count,
         forked_from=forked_from,
         recovered_from=recovered_from,
+        compactions=compactions,
+        compaction_budget_chars=compaction_budget_chars,
+        compaction_before_characters=compaction_before_characters,
+        compaction_after_characters=compaction_after_characters,
     )
 
 
@@ -423,6 +458,16 @@ def _event_line(event: Event, limit: int) -> str:
         return (
             f"[model_requested] step={_as_text(payload.get('step')) or '?'} "
             f"messages={_as_text(payload.get('message_count')) or '?'} tools={tool_text}"
+        )
+    if event_type == "context_compacted":
+        before = _as_text(payload.get("before_characters")) or "?"
+        after = _as_text(payload.get("after_characters")) or "?"
+        budget = _as_text(payload.get("budget_chars")) or "?"
+        summary = _clip(_as_text(payload.get("summary")), limit)
+        return (
+            f"[context_compacted] strategy={_as_text(payload.get('strategy')) or '?'} "
+            f"chars={before}->{after} budget={budget}"
+            + (f" summary={summary}" if summary else "")
         )
     if event_type == "model_responded":
         calls = payload.get("tool_calls") or []

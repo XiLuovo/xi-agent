@@ -60,6 +60,7 @@ class SessionProjection:
     # the public projection object remains compatible.
     session_id: str = ""
     recovery: RecoveryPoint | None = None
+    context_budget_chars: int | None = None
 
 
 def project_session(
@@ -69,9 +70,10 @@ def project_session(
 ) -> SessionProjection:
     """Project a resumable or recoverable Run into reusable model context.
 
-    The most recent ``model_requested`` event already contains the canonical
-    conversation sent to the model. Projection restores that snapshot and
-    folds in any complete response/tool exchange persisted after it.
+    The most recent ``model_requested`` or ``context_compacted`` event contains
+    a canonical model conversation snapshot. Projection restores the later
+    checkpoint and folds in any complete response/tool exchange persisted
+    after it.
     ``at_event_id`` remains the strict Fork path and accepts only a successful
     ``run_finished`` endpoint. Without it, a failed or safely incomplete tail
     is projected as Recovery state.
@@ -122,24 +124,26 @@ def project_session(
     if not workspace.exists() or not workspace.is_dir():
         raise SessionProjectionError(f"trace 记录的工作区不是目录: {workspace}")
 
-    request_index = -1
-    raw_messages: Any = None
+    checkpoint_index = -1
+    checkpoint_event: Event | None = None
     for index, event in enumerate(selected_events):
-        if (
-            event.run_id == final_event.run_id
-            and event.type == "model_requested"
-            and isinstance(event.payload.get("messages"), list)
-        ):
-            request_index = index
-            raw_messages = event.payload["messages"]
-    if request_index < 0 or raw_messages is None:
+        if event.run_id != final_event.run_id:
+            continue
+        if event.type not in {"model_requested", "context_compacted"}:
+            continue
+        if not isinstance(event.payload.get("messages"), list):
+            continue
+        checkpoint_index = index
+        checkpoint_event = event
+    if checkpoint_index < 0 or checkpoint_event is None:
         raise SessionProjectionError(
-            "trace 未保存 model_requested.messages，无法恢复模型上下文"
+            "trace 未保存可用的模型上下文检查点，无法恢复模型上下文"
         )
 
     messages = _project_messages_from_checkpoint(
         selected_events,
-        request_index=request_index,
+        checkpoint_index=checkpoint_index,
+        checkpoint_event=checkpoint_event,
         run_id=final_event.run_id,
         require_response=recovery_state is None,
     )
@@ -153,6 +157,17 @@ def project_session(
     context_strategy = latest_started.get("context_strategy", "search")
     if not isinstance(context_strategy, str) or not context_strategy.strip():
         context_strategy = "search"
+    raw_budget = latest_started.get("context_budget_chars")
+    try:
+        context_budget_chars = (
+            None
+            if raw_budget is None
+            else int(raw_budget)
+        )
+    except (TypeError, ValueError):
+        context_budget_chars = None
+    if context_budget_chars is not None and context_budget_chars <= 0:
+        context_budget_chars = None
     return SessionProjection(
         source=trace.source,
         session_id=final_event.session_id or final_event.run_id,
@@ -165,11 +180,12 @@ def project_session(
         recovery=(
             RecoveryPoint(
                 state=recovery_state,
-                checkpoint_event_id=selected_events[request_index].event_id,
+                checkpoint_event_id=checkpoint_event.event_id,
             )
             if recovery_state is not None
             else None
         ),
+        context_budget_chars=context_budget_chars,
     )
 
 
@@ -245,17 +261,28 @@ def _ensure_no_unfinished_tool_execution(events: tuple[Event, ...]) -> None:
 def _project_messages_from_checkpoint(
     events: tuple[Event, ...],
     *,
-    request_index: int,
+    checkpoint_index: int,
+    checkpoint_event: Event,
     run_id: str,
     require_response: bool,
 ) -> list[dict[str, Any]]:
-    raw_messages = events[request_index].payload.get("messages")
+    raw_messages = checkpoint_event.payload.get("messages")
     if not isinstance(raw_messages, list):
         raise SessionProjectionError(
-            "安全检查点缺少 model_requested.messages，无法恢复模型上下文"
+            "安全检查点缺少完整 messages，无法恢复模型上下文"
         )
     messages = _normalize_messages(raw_messages)
-    tail = [event for event in events[request_index + 1 :] if event.run_id == run_id]
+    tail = [event for event in events[checkpoint_index + 1 :] if event.run_id == run_id]
+    # A compaction checkpoint is itself a complete model snapshot.  Runtime
+    # emits it immediately before the next request, so an interruption here
+    # has no response/tool suffix to reconstruct.  If a malformed trace does
+    # contain a suffix, only accept a complete single response exchange.
+    if checkpoint_event.type == "context_compacted" and not tail:
+        if require_response:
+            raise SessionProjectionError(
+                "成功 Run 的压缩检查点后缺少 model_responded，无法恢复"
+            )
+        return messages
     responses = [event for event in tail if event.type == "model_responded"]
     if len(responses) > 1:
         raise SessionProjectionError("安全检查点之后包含多个 model_responded，无法确定上下文")

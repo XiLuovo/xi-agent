@@ -14,6 +14,13 @@ from .completion import (
     PermissiveCompletionContract,
     ToolExecutionEvidence,
 )
+from .compaction import (
+    CompactionError,
+    CompactionResult,
+    ContextCompactor,
+    DeterministicCompactor,
+    message_characters,
+)
 from .context import ContextBuilder, RepoMapContextBuilder, SearchContextBuilder
 from .events import Event, EventCollection, JsonlSessionStore, MemorySessionStore
 from .models import ModelResponse, OpenAICompatibleModel, OpenAIModel, ScriptedModel, ToolCall
@@ -28,6 +35,11 @@ __all__ = [
     "SessionProjection",
     "SessionProjectionError",
     "project_session",
+    "CompactionError",
+    "CompactionResult",
+    "ContextCompactor",
+    "DeterministicCompactor",
+    "message_characters",
     "CompletionContract",
     "CompletionDecision",
     "CompletionEvidence",
