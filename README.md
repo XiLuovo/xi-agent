@@ -4,7 +4,7 @@ Xi 是一个使用 Python 实现的通用 Coding Agent Runtime。它通过自然
 并在受限工作区内自主完成代码搜索、文件读取、补丁修改和测试验证。
 
 这个项目关注的不是简单封装大模型 API，而是 Coding Agent 的运行时机制：模型如何与
-工具循环协作，工具调用如何受到权限策略约束，执行过程如何被记录、回放和恢复，以及
+工具循环协作，工具调用如何受到权限策略约束，执行过程如何被记录、回放、恢复和分叉，以及
 不同上下文策略如何通过可重复实验进行比较。
 
 ## 项目定位
@@ -16,6 +16,7 @@ Xi 当前已经具备一个可运行、可研究的最小闭环：
 - 支持代码搜索、文件读取、补丁修改和测试命令执行；
 - 记录可审计的 JSONL 事件 Trace，并支持离线回放；
 - 支持从 Trace 恢复上下文并继续执行；
+- 支持从历史成功 Run 的结束事件创建独立 Session 分支；
 - 使用 Session Schema v2 区分稳定的 `session_id` 与每轮独立的 `run_id`；
 - 提供基于证据的完成契约，避免模型只描述修改而没有真正执行；
 - 提供 `search` 与 `repo-map` 两种上下文策略和可重复 Benchmark。
@@ -47,6 +48,8 @@ xi -p "修复固定 Bug" --allow-command "python -m pytest -q tests/test_bug.py"
 xi -p "定位跨文件调用链问题" --context-strategy repo-map
 xi resume .xi\traces\20260820-120000-abcd1234.jsonl
 xi resume .xi\traces\20260820-120000-abcd1234.jsonl -p "继续检查刚才的修改"
+xi fork .xi\traces\20260820-120000-abcd1234.jsonl --at-event <run_finished事件ID>
+xi fork .xi\traces\20260820-120000-abcd1234.jsonl --at-event <run_finished事件ID> -p "尝试另一种方案"
 ```
 
 ## 核心运行流程
@@ -63,7 +66,7 @@ xi resume .xi\traces\20260820-120000-abcd1234.jsonl -p "继续检查刚才的修
   → 最终结果
 ```
 
-交互模式、一次性任务、Benchmark 和 Session Resume 都复用同一个 `AgentRuntime`，
+交互模式、一次性任务、Benchmark、Session Resume 和 Session Fork 都复用同一个 `AgentRuntime`，
 而不是各自维护一套 Agent 循环。
 
 普通任务默认采用宽松完成语义。需要证据驱动完成时，可以明确要求文件改动和指定命令
@@ -170,7 +173,30 @@ xi resume .xi\traces\20260820-120000-abcd1234.jsonl -p "继续完成剩余工作
 Session Projection 会从事件流中恢复最近一次发送给模型的消息，并合入该轮最终响应。
 旧版 v1 Trace 没有 `session_id` 时，会用其原有 `run_id` 推导会话身份；恢复后新增的
 事件会按 v2 格式继续写入。当前版本只恢复正常完成且保存了
-`model_requested.messages` 的 trace；失败会话、fork 和 compaction 留在后续阶段。
+`model_requested.messages` 的 trace；失败会话和 compaction 留在后续阶段。
+
+## 会话分叉（Session Fork）
+
+`fork` 从历史成功 Run 的 `run_finished` 事件创建独立分支。它只继承目标事件及其
+之前已经发送给模型的上下文，不会看见来源 Trace 中更晚的 Run：
+
+```powershell
+# 分叉后进入自然语言交互
+xi fork .xi\traces\source.jsonl --at-event <run_finished事件ID>
+
+# 分叉后只执行一轮
+xi fork .xi\traces\source.jsonl --at-event <run_finished事件ID> -p "改用另一种修复方案"
+
+# 可显式指定新的 Trace；目标文件必须尚不存在
+xi fork .xi\traces\source.jsonl --at-event <run_finished事件ID> `
+  --trace .xi\traces\alternative.jsonl -p "继续"
+```
+
+Fork 只接受 `success=true` 的 `run_finished`。新分支使用来源 Trace 记录的工作区，
+但会创建新的 Trace、`session_id` 和 `run_id`；来源 Trace 保持只读。新 Trace 的首个
+`run_started.parent_id` 为 `null`，不会跨 Trace 建立因果父链，并在
+`run_started.payload.forked_from` 中记录来源 Trace、`session_id`、`run_id` 和
+`event_id`。后续同一分支内的 Run 再按正常 Session 因果关系连接。
 
 ## Trace 回放（Trace Replay）
 
@@ -180,7 +206,8 @@ Session Projection 会从事件流中恢复最近一次发送给模型的消息�
 xi replay .xi\benchmarks\order-total-quantity-001\20260820-085219-19e2a9f3\trace.jsonl
 ```
 
-Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运行摘要；它不会
+Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运行摘要；Fork Trace
+还会显示分支来源。Replay 不会
 调用模型、执行工具或命令，也不会修改工作区，因此不是 resume 或重新执行。
 回放会显示会话 ID、运行轮数与各轮连接关系，并检查 JSON 合法性、单一
 `session_id`、唯一 `event_id`，以及按顺序可解析的 `parent_id`。一个 v2 Trace 可包含
@@ -188,7 +215,7 @@ Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运�
 
 ## 后续路线
 
-- Session Fork：从历史事件节点创建独立分支；
+- 将 Session Fork 扩展到更多安全的历史节点；
 - 失败或中断会话恢复；
 - 长会话上下文压缩（Compaction）及对应实验；
 - Docker Executor，进一步加强进程与文件系统隔离。

@@ -26,15 +26,16 @@ from .replay import ReplayError, load_trace
 
 
 class SessionProjectionError(ValueError):
-    """Raised when a trace cannot be projected into a resumable session."""
+    """Raised when a trace cannot be projected into reusable Session state."""
 
 
 @dataclass(frozen=True, slots=True)
 class SessionProjection:
-    """Minimal durable state required to continue one Xi session.
+    """Minimal durable state required to resume or fork a Xi Session.
 
-    ``last_event_id`` is part of the interface because the next ``run_started``
-    event must link to it when new events are appended to the same trace.
+    Resume uses ``last_event_id`` as the next ``run_started`` parent in the
+    same Trace. Fork records it as the source endpoint but deliberately starts
+    the new Trace with no parent.
     """
 
     source: Path
@@ -51,13 +52,18 @@ class SessionProjection:
     session_id: str = ""
 
 
-def project_session(path: str | Path) -> SessionProjection:
-    """Load a successfully completed trace as a resumable conversation.
+def project_session(
+    path: str | Path,
+    *,
+    at_event_id: str | None = None,
+) -> SessionProjection:
+    """Project a successful Run endpoint into reusable model context.
 
     The most recent ``model_requested`` event already contains the canonical
     conversation sent to the model. Projection restores that snapshot and
-    folds in the response that completed the turn. This keeps reconstruction
-    local to this module and also supports several continued turns.
+    folds in the response that completed the selected turn. ``at_event_id``
+    limits projection to that event and everything before it, which lets Fork
+    inherit historical context without seeing later Runs in the source Trace.
     """
 
     try:
@@ -65,11 +71,27 @@ def project_session(path: str | Path) -> SessionProjection:
     except ReplayError as exc:
         raise SessionProjectionError(str(exc)) from exc
 
-    final_event = trace.events[-1]
-    if final_event.type != "run_finished" or not final_event.payload.get("success", True):
-        raise SessionProjectionError("当前仅支持恢复正常完成、以 run_finished 结尾的 trace")
+    target_index = len(trace.events) - 1
+    if at_event_id is not None:
+        target_index = next(
+            (
+                index
+                for index, event in enumerate(trace.events)
+                if event.event_id == at_event_id
+            ),
+            -1,
+        )
+        if target_index < 0:
+            raise SessionProjectionError(f"trace 不包含指定 event_id: {at_event_id}")
+    selected_events = trace.events[: target_index + 1]
+    final_event = selected_events[-1]
+    if (
+        final_event.type != "run_finished"
+        or final_event.payload.get("success", True) is not True
+    ):
+        raise SessionProjectionError("目标事件必须是成功的 run_finished")
 
-    started_events = [event for event in trace.events if event.type == "run_started"]
+    started_events = [event for event in selected_events if event.type == "run_started"]
     if not started_events:
         raise SessionProjectionError("trace 缺少 run_started，无法确定工作区")
 
@@ -87,8 +109,12 @@ def project_session(path: str | Path) -> SessionProjection:
 
     request_index = -1
     raw_messages: Any = None
-    for index, event in enumerate(trace.events):
-        if event.type == "model_requested" and isinstance(event.payload.get("messages"), list):
+    for index, event in enumerate(selected_events):
+        if (
+            event.run_id == final_event.run_id
+            and event.type == "model_requested"
+            and isinstance(event.payload.get("messages"), list)
+        ):
             request_index = index
             raw_messages = event.payload["messages"]
     if request_index < 0 or raw_messages is None:
@@ -98,7 +124,9 @@ def project_session(path: str | Path) -> SessionProjection:
 
     messages = _normalize_messages(raw_messages)
     response_seen = False
-    for event in trace.events[request_index + 1 :]:
+    for event in selected_events[request_index + 1 :]:
+        if event.run_id != final_event.run_id:
+            continue
         payload = event.payload
         if event.type == "model_responded" and not response_seen:
             messages.append(_assistant_message(payload))
@@ -122,14 +150,19 @@ def project_session(path: str | Path) -> SessionProjection:
     if not response_seen:
         raise SessionProjectionError("trace 缺少完成当前轮次的 model_responded 事件")
 
-    latest_started = started_events[-1].payload
+    target_started_events = [
+        event for event in started_events if event.run_id == final_event.run_id
+    ]
+    if not target_started_events:
+        raise SessionProjectionError("目标 Run 缺少 run_started")
+    latest_started = target_started_events[-1].payload
     context_strategy = latest_started.get("context_strategy", "search")
     if not isinstance(context_strategy, str) or not context_strategy.strip():
         context_strategy = "search"
     return SessionProjection(
         source=trace.source,
-        session_id=trace.summary.session_id,
-        run_id=trace.summary.run_id,
+        session_id=final_event.session_id or final_event.run_id,
+        run_id=final_event.run_id,
         workspace=workspace,
         messages=tuple(deepcopy(messages)),
         last_event_id=final_event.event_id,

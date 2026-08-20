@@ -112,9 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--prompt", help="一次性执行任务后退出（headless）")
     parser.add_argument(
         "--workspace",
-        help="受限工作区目录；普通运行默认当前目录，resume 默认使用 trace 中记录的目录",
+        help="受限工作区目录；普通运行默认当前目录，resume/fork 默认使用来源 trace 中记录的目录",
     )
     parser.add_argument("--trace", help="JSONL trace 路径；默认写入 .xi/traces")
+    parser.add_argument(
+        "--at-event",
+        help="fork 的来源 run_finished event_id",
+    )
     parser.add_argument("--jsonl", action="store_true", help="--json 的兼容别名")
     parser.add_argument("--script", help="ScriptedModel 的 JSON/JSONL 响应文件")
     parser.add_argument("--model", help="OpenAI-compatible 模型名")
@@ -159,12 +163,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.json = args.json or args.jsonl
+    if args.command != "fork" and args.at_event is not None:
+        parser.error("--at-event 仅用于 xi fork")
     if args.command == "replay":
         return _run_replay_command(parser, args)
     load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
     projection: SessionProjection | None = None
+    session_action: str | None = None
     if args.command == "resume":
+        session_action = "resume"
         projection = _load_resume_projection(parser, args)
+        if projection is None:
+            return 1
+        prompt = args.prompt if args.prompt is not None else args.task
+    elif args.command == "fork":
+        session_action = "fork"
+        projection = _load_fork_projection(parser, args)
         if projection is None:
             return 1
         prompt = args.prompt if args.prompt is not None else args.task
@@ -179,13 +193,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if projection is not None and workspace != projection.workspace:
         parser.error(
-            "resume 必须使用 trace 中记录的工作区；当前为 "
+            f"{session_action} 必须使用来源 trace 中记录的工作区；当前为 "
             f"{projection.workspace}"
         )
     if not workspace.exists() or not workspace.is_dir():
         parser.error(f"工作区不是目录: {workspace}")
-    trace_path = projection.source if projection is not None else _resolve_trace_path(args.trace, workspace)
-    if projection is not None and args.trace is not None:
+    if session_action == "resume" and projection is not None:
+        trace_path = projection.source
+    elif session_action == "fork" and projection is not None:
+        trace_path = _resolve_fork_trace_path(parser, args.trace, workspace, projection)
+    else:
+        trace_path = _resolve_trace_path(args.trace, workspace)
+    if session_action == "resume" and projection is not None and args.trace is not None:
         requested_trace = Path(args.trace).expanduser().resolve()
         if requested_trace != projection.source:
             parser.error("resume 会继续写入原 trace，不能通过 --trace 改写到其他文件")
@@ -227,8 +246,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             auto_approve=args.auto_approve,
             approval_callback=_approval_prompt,
         )
-        if projection is not None:
+        if session_action == "resume" and projection is not None:
             runtime.restore_session(projection)
+        elif session_action == "fork" and projection is not None:
+            runtime.fork_session(projection)
         if prompt is not None:
             result = runtime.run(
                 prompt,
@@ -286,6 +307,27 @@ def _load_resume_projection(
         return None
 
 
+def _load_fork_projection(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> SessionProjection | None:
+    if len(args.command_args) != 1 or not args.at_event:
+        parser.error(
+            "用法：xi fork <source-trace> --at-event <run_finished事件ID>；"
+            "执行一轮可加 -p \"任务\""
+        )
+    try:
+        return project_session(
+            args.command_args[0],
+            at_event_id=args.at_event,
+        )
+    except SessionProjectionError as exc:
+        message = Text("fork 失败：", style="red")
+        message.append(str(exc))
+        _error_console.print(message)
+        return None
+
+
 def _resolve_prompt(args: argparse.Namespace) -> str | None:
     if args.prompt is not None:
         return args.prompt
@@ -330,6 +372,20 @@ def _resolve_trace_path(raw: str | None, workspace: Path) -> Path:
         return Path(raw).expanduser().resolve()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return workspace / ".xi" / "traces" / f"{stamp}-{uuid4().hex[:8]}.jsonl"
+
+
+def _resolve_fork_trace_path(
+    parser: argparse.ArgumentParser,
+    raw: str | None,
+    workspace: Path,
+    projection: SessionProjection,
+) -> Path:
+    trace_path = _resolve_trace_path(raw, workspace)
+    if trace_path == projection.source:
+        parser.error("fork 必须写入新 trace，不能覆盖或追加来源 trace")
+    if trace_path.exists():
+        parser.error(f"fork 目标 trace 已存在，必须使用新路径: {trace_path}")
+    return trace_path
 
 
 def _print_event(event) -> None:

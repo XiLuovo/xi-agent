@@ -96,6 +96,7 @@ class AgentRuntime:
         self._conversation: list[dict[str, Any]] = []
         self._session_id = session_id or uuid4().hex
         self._session_parent_id: str | None = None
+        self._forked_from: dict[str, str] | None = None
 
     @property
     def conversation(self) -> list[dict[str, Any]]:
@@ -128,6 +129,32 @@ class AgentRuntime:
         self._conversation = deepcopy(list(projection.messages))
         self._session_id = projection.session_id or projection.run_id
         self._session_parent_id = projection.last_event_id
+        self._forked_from = None
+
+    def fork_session(self, projection: SessionProjection) -> None:
+        """Seed a new Session from historical context in another Trace.
+
+        Unlike :meth:`restore_session`, Fork keeps no cross-Trace parent link
+        and never reuses the source Session identity. The source location is
+        recorded once on the new Trace's first ``run_started`` event.
+        """
+
+        if projection.workspace != self.workspace:
+            raise ValueError(
+                "分叉会话的工作区与 Runtime 不一致: "
+                f"{projection.workspace} != {self.workspace}"
+            )
+        if any(True for _event in self.session_store.events):
+            raise ValueError("fork 必须写入空的新 trace")
+        self._conversation = deepcopy(list(projection.messages))
+        self._session_id = uuid4().hex
+        self._session_parent_id = None
+        self._forked_from = {
+            "trace": str(projection.source),
+            "session_id": projection.session_id or projection.run_id,
+            "run_id": projection.run_id,
+            "event_id": projection.last_event_id,
+        }
 
     def close(self) -> None:
         self.session_store.close()
@@ -154,8 +181,10 @@ class AgentRuntime:
         is_interactive = self.interactive if interactive is None else interactive
         approve = approval_callback or self.approval_callback
         is_session_run = bool(continue_session)
-        # Every user turn is a distinct Run.  Continuing a Session reuses only
-        # the Session identity and the prior event as causal parent.
+        forked_from = deepcopy(self._forked_from)
+        is_fork_run = forked_from is not None
+        # Every user turn is a distinct Run. Resume reuses the Session identity
+        # and prior event; the first Fork Run instead starts a new causal root.
         run_id = uuid4().hex
         session_parent_id = self._session_parent_id if is_session_run else None
         run_events: list[Event] = []
@@ -200,20 +229,27 @@ class AgentRuntime:
             context_characters = 0
             context_error = exc
 
+        started_payload: dict[str, Any] = {
+            "task": task,
+            "workspace": str(self.workspace),
+            "interactive": is_interactive,
+            "max_steps": self.max_steps,
+            "context_strategy": context_strategy,
+            "context_characters": context_characters,
+            "completion_contract": completion_contract_name,
+            "session_continued": bool(
+                is_session_run and self._conversation and not is_fork_run
+            ),
+        }
+        if forked_from is not None:
+            started_payload["forked_from"] = forked_from
         started = emit(
             "run_started",
-            {
-                "task": task,
-                "workspace": str(self.workspace),
-                "interactive": is_interactive,
-                "max_steps": self.max_steps,
-                "context_strategy": context_strategy,
-                "context_characters": context_characters,
-                "completion_contract": completion_contract_name,
-                "session_continued": bool(is_session_run and self._conversation),
-            },
+            started_payload,
             parent_id=session_parent_id,
         )
+        if is_fork_run:
+            self._forked_from = None
 
         if context_error is not None:
             return self._failed(

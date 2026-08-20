@@ -40,6 +40,7 @@ class ReplaySummary:
     session_id: str = ""
     run_ids: tuple[str, ...] = ()
     run_count: int = 0
+    forked_from: dict[str, str] | None = None
 
     @property
     def runs(self) -> int:
@@ -160,9 +161,19 @@ def render_trace(trace: ReplayTrace, *, max_text: int = 180) -> str:
         f"run_ids: {_format_run_ids(summary.run_ids, limit)}",
         f"latest_run_id: {_clip(summary.run_id, limit)}",
         f"latest_task: {_clip(summary.task, limit)}",
-        "",
-        "时间线:",
     ]
+    if summary.forked_from:
+        origin = summary.forked_from
+        lines.extend(
+            [
+                "分支来源:",
+                f"  trace: {_clip(origin.get('trace', ''), limit)}",
+                f"  session_id: {_clip(origin.get('session_id', ''), limit)}",
+                f"  run_id: {_clip(origin.get('run_id', ''), limit)}",
+                f"  event_id: {_clip(origin.get('event_id', ''), limit)}",
+            ]
+        )
+    lines.extend(["", "时间线:"])
     first_time = _parse_timestamp(trace.events[0].timestamp)
     for event in trace.events:
         offset = _relative_time(first_time, event.timestamp)
@@ -269,6 +280,7 @@ def _summarize(
     duration: float | None = None
     final_text = ""
     error: str | None = None
+    forked_from: dict[str, str] | None = None
 
     for event in events:
         payload = event.payload
@@ -276,6 +288,8 @@ def _summarize(
             continue
         if event.type == "run_started":
             run_steps.append(0)
+            if forked_from is None:
+                forked_from = _normalize_fork_origin(payload.get("forked_from"))
             event_task = _as_text(payload.get("task"))
             if event_task:
                 task = event_task
@@ -351,6 +365,7 @@ def _summarize(
         session_id=session_id,
         run_ids=run_ids,
         run_count=run_count,
+        forked_from=forked_from,
     )
 
 
@@ -359,10 +374,19 @@ def _event_line(event: Event, limit: int) -> str:
     event_type = event.type
     if event_type == "run_started":
         parent = _clip(event.parent_id or "-", 16)
-        return (
+        line = (
             f"[run_started] run_id={_clip(event.run_id, 16)} "
             f"parent={parent} task={_clip(_as_text(payload.get('task')), limit)}"
         )
+        origin = _normalize_fork_origin(payload.get("forked_from"))
+        if origin:
+            line += (
+                " forked_from="
+                f"{_clip(origin.get('session_id', ''), 12)}/"
+                f"{_clip(origin.get('run_id', ''), 12)}/"
+                f"{_clip(origin.get('event_id', ''), 12)}"
+            )
+        return line
     if event_type == "model_requested":
         tools = payload.get("tools") or []
         tool_text = ",".join(_clip(_as_text(item), 40) for item in tools) or "-"
@@ -457,6 +481,14 @@ def _format_counts(values: Mapping[str, int]) -> str:
     if not values:
         return "0"
     return ", ".join(f"{key}={value}" for key, value in values.items())
+
+
+def _normalize_fork_origin(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    keys = ("trace", "session_id", "run_id", "event_id")
+    origin = {key: _as_text(value.get(key)) for key in keys}
+    return origin if all(origin.values()) else None
 
 
 def _format_run_ids(run_ids: tuple[str, ...], limit: int) -> str:
