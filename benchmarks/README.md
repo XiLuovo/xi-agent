@@ -108,6 +108,38 @@ Compare 会为每种策略统计 Case 成功率、整套 Suite 通过率，以�
 `--case` 与 `--suite` 互斥。Live 模式读取项目根目录的 `.env`，可能产生真实
 API 调用与费用；Scripted 模式完全离线。
 
+## 长会话上下文压缩 Case
+
+`long_session_compaction` 是独立于 Core Suite 的长会话研究 Case：fixture 包含一个
+发票汇总 Bug、测试、受保护的历史资料和固定 ScriptedModel 轨迹。轨迹会经过
+`search_code`、多次 `read_file`（包括较大输出）、`apply_patch` 和唯一测试命令；只允许
+修改 `invoice_summary.py`。它不改变 Core Suite 的五个 Case，也不把实验结果混入 Suite。
+
+使用专门编排器比较关闭压缩和两个字符预算：
+
+```powershell
+.\.venv\Scripts\python.exe benchmarks\compaction.py --mode scripted
+```
+
+编排器为每个条件创建独立工作区，复用 `benchmarks/run.py` 的 Case 执行与评分 seam，
+并生成 `report.json`、`report.md` 以及每个条件的 Trace/Workspace 产物：
+
+```text
+.xi/benchmark-compaction/long_session_compaction/<experiment-id>/
+├── runs/
+│   ├── off/
+│   ├── budget-1800/
+│   └── budget-4200/
+├── report.json
+└── report.md
+```
+
+Runner 与实验报告记录 `context_compactions`、压缩前后字符数、模型请求次数及其
+稳定 JSON 字符数（字符预算不是 token 估算），并保留步骤、工具调用、耗时、改动文件和
+路径契约。实验只有在关闭条件没有压缩、至少一个预算条件发生实际压缩且所有条件的
+Agent/验证/保护路径标准通过时才返回 0；Runner 非零退出不会被静默视为成功。实验是
+内部评测基础设施，普通用户仍通过 `xi` 或 `xi -p "任务"` 交互。
+
 ## 评分与产物
 
 每个 Case 至少检查：

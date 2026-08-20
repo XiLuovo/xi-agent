@@ -149,6 +149,20 @@ Live Suite 会调用真实模型，本地确定性验证应使用 scripted。详
 产物路径。详细接口和
 产物布局见 [benchmarks/README.md](benchmarks/README.md)。
 
+长会话上下文压缩评测是独立于 Core Suite 的离线实验入口。它复用现有 Case Runner，
+对同一个长会话修复任务比较关闭压缩和两个字符预算；字符预算是稳定 JSON 字符数，
+不是 token 计数：
+
+```powershell
+.\.venv\Scripts\python.exe benchmarks\compaction.py --mode scripted
+```
+
+每个条件使用独立工作区，实验会生成 JSON/Markdown 报告和对应 Trace 产物；只有三种
+条件都完成任务并通过唯一验证、关闭条件压缩次数为 0、至少一个预算条件发生实际字符
+减少时才成功。实验结果记录在
+[上下文压缩实验](docs/experiments/context-compaction.md)；这仍是内部评测基础设施，
+普通用户继续使用 `xi` 与 `xi -p "任务"`。
+
 ## 安全边界
 
 Xi 的本地执行器会约束工作目录、文件路径、超时和输出长度，但它不是 OS

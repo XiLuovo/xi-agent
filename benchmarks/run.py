@@ -27,6 +27,16 @@ class BenchmarkError(RuntimeError):
     """Raised when a benchmark manifest or artifact layout is invalid."""
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("必须是正整数") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return parsed
+
+
 def _configure_windows_utf8_streams() -> None:
     if sys.platform != "win32":
         return
@@ -58,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="上下文策略：search 按需搜索；repo-map 预先提供仓库地图",
     )
     parser.add_argument(
+        "--context-budget-chars",
+        type=_positive_int,
+        help="显式启用上下文压缩的字符预算；默认关闭（不是 token 计数）",
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=PROJECT_ROOT / ".xi" / "benchmarks",
@@ -77,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.mode,
                 args.output_root,
                 context_strategy=args.context_strategy,
+                context_budget_chars=args.context_budget_chars,
             )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False))
@@ -88,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.mode,
                 args.output_root,
                 context_strategy=args.context_strategy,
+                context_budget_chars=args.context_budget_chars,
             )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False))
@@ -104,6 +121,7 @@ def _run_case(
     output_root: Path,
     *,
     context_strategy: str = "search",
+    context_budget_chars: int | None = None,
     run_dir: Path | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
@@ -176,6 +194,8 @@ def _run_case(
         "--require-successful-command",
         test_command,
     ]
+    if context_budget_chars is not None:
+        command.extend(["--context-budget-chars", str(context_budget_chars)])
     if script_path is not None:
         command.extend(["--script", str(script_path)])
 
@@ -241,6 +261,21 @@ def _run_case(
         "run_id": run_id,
         "mode": mode,
         "context_strategy": context_strategy,
+        "context_budget_chars": context_budget_chars,
+        "context_compactions": trace_summary.get("context_compactions", 0),
+        "compaction_before_characters": trace_summary.get(
+            "compaction_before_characters", 0
+        ),
+        "compaction_after_characters": trace_summary.get(
+            "compaction_after_characters", 0
+        ),
+        "model_request_count": trace_summary.get("model_request_count", 0),
+        "max_model_request_characters": trace_summary.get(
+            "max_model_request_characters", 0
+        ),
+        "total_model_request_characters": trace_summary.get(
+            "total_model_request_characters", 0
+        ),
         "passed": passed,
         "duration_seconds": duration_seconds,
         "criteria": criteria,
@@ -278,6 +313,7 @@ def _run_suite(
     output_root: Path,
     *,
     context_strategy: str = "search",
+    context_budget_chars: int | None = None,
 ) -> dict[str, Any]:
     manifest = _load_suite(suite_name)
     suite_id = str(manifest["id"])
@@ -306,6 +342,7 @@ def _run_suite(
                 context_strategy=context_strategy,
                 run_dir=case_run_dir,
                 run_id=case_run_id,
+                context_budget_chars=context_budget_chars,
             )
         except Exception as exc:
             case_result = _runner_failure_result(
@@ -316,6 +353,7 @@ def _run_suite(
                 round(time.monotonic() - case_started_at, 3),
                 exc,
                 context_strategy=context_strategy,
+                context_budget_chars=context_budget_chars,
             )
         case_results.append(case_result)
 
@@ -332,12 +370,33 @@ def _run_suite(
     usage: Counter[str] = Counter()
     context_characters = 0
     completion_rejections = 0
+    context_compactions = 0
+    compaction_before_characters = 0
+    compaction_after_characters = 0
+    model_request_count = 0
+    max_model_request_characters = 0
+    total_model_request_characters = 0
     for item in summaries:
         tool_calls.update(item["tool_calls"])
         characters = item["context"].get("characters")
         if isinstance(characters, int) and not isinstance(characters, bool):
             context_characters += characters
         completion_rejections += int(item["completion"].get("rejections") or 0)
+        context_compactions += _nonnegative_int(item.get("context_compactions"))
+        compaction_before_characters += _nonnegative_int(
+            item.get("compaction_before_characters")
+        )
+        compaction_after_characters += _nonnegative_int(
+            item.get("compaction_after_characters")
+        )
+        model_request_count += _nonnegative_int(item.get("model_request_count"))
+        max_model_request_characters = max(
+            max_model_request_characters,
+            _nonnegative_int(item.get("max_model_request_characters")),
+        )
+        total_model_request_characters += _nonnegative_int(
+            item.get("total_model_request_characters")
+        )
         usage.update(
             {
                 key: value
@@ -352,6 +411,7 @@ def _run_suite(
         "title": manifest.get("title", suite_id),
         "mode": mode,
         "context_strategy": context_strategy,
+        "context_budget_chars": context_budget_chars,
         "run_id": suite_run_id,
         "passed": failed_cases == 0,
         "total_cases": total_cases,
@@ -361,6 +421,12 @@ def _run_suite(
         "success_rate_percent": round(success_rate * 100, 2),
         "total_duration_seconds": total_duration_seconds,
         "context_characters": context_characters,
+        "context_compactions": context_compactions,
+        "compaction_before_characters": compaction_before_characters,
+        "compaction_after_characters": compaction_after_characters,
+        "model_request_count": model_request_count,
+        "max_model_request_characters": max_model_request_characters,
+        "total_model_request_characters": total_model_request_characters,
         "completion_rejections": completion_rejections,
         "tool_calls": dict(sorted(tool_calls.items())),
         "usage": dict(sorted(usage.items())),
@@ -568,14 +634,7 @@ def _timeout_text(value: str | bytes | None) -> str:
 
 def _summarize_trace(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return {
-            "exists": False,
-            "event_count": 0,
-            "tool_calls": {},
-            "files_changed": [],
-            "usage": {},
-            "completion": {},
-        }
+        return _empty_trace_summary()
     events = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -587,14 +646,52 @@ def _summarize_trace(path: Path) -> dict[str, Any]:
     usage: dict[str, Any] = {}
     context: dict[str, Any] = {}
     completion: dict[str, Any] = {"contract": None, "rejections": 0}
+    context_budget_chars: int | None = None
+    context_compactions = 0
+    compaction_before_characters = 0
+    compaction_after_characters = 0
+    model_request_count = 0
+    max_model_request_characters = 0
+    total_model_request_characters = 0
     for event in events:
         if event.get("type") == "run_started":
             payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            parsed_budget = _nonnegative_int(payload.get("context_budget_chars"))
+            if parsed_budget:
+                context_budget_chars = parsed_budget
             context = {
                 "strategy": payload.get("context_strategy"),
                 "characters": payload.get("context_characters"),
+                "budget_chars": context_budget_chars,
             }
             completion["contract"] = payload.get("completion_contract")
+        elif event.get("type") == "model_requested":
+            model_request_count += 1
+            payload = event.get("payload", {})
+            if isinstance(payload, dict):
+                request_characters = _stable_json_characters(
+                    payload.get("messages", [])
+                )
+                max_model_request_characters = max(
+                    max_model_request_characters,
+                    request_characters,
+                )
+                total_model_request_characters += request_characters
+        elif event.get("type") == "context_compacted":
+            context_compactions += 1
+            payload = event.get("payload", {})
+            if isinstance(payload, dict):
+                parsed_budget = _nonnegative_int(payload.get("budget_chars"))
+                if parsed_budget:
+                    context_budget_chars = parsed_budget
+                compaction_before_characters += _nonnegative_int(
+                    payload.get("before_characters")
+                )
+                compaction_after_characters += _nonnegative_int(
+                    payload.get("after_characters")
+                )
         elif event.get("type") == "tool_started":
             tool = str(event.get("payload", {}).get("tool", "unknown"))
             tool_calls[tool] = tool_calls.get(tool, 0) + 1
@@ -611,6 +708,17 @@ def _summarize_trace(path: Path) -> dict[str, Any]:
             if isinstance(event_usage, dict):
                 usage = event_usage
     final_payload = final_event.get("payload", {}) if final_event else {}
+    context.update(
+        {
+            "budget_chars": context_budget_chars,
+            "compactions": context_compactions,
+            "compaction_before_characters": compaction_before_characters,
+            "compaction_after_characters": compaction_after_characters,
+            "model_request_count": model_request_count,
+            "max_model_request_characters": max_model_request_characters,
+            "total_model_request_characters": total_model_request_characters,
+        }
+    )
     return {
         "exists": True,
         "event_count": len(events),
@@ -621,7 +729,68 @@ def _summarize_trace(path: Path) -> dict[str, Any]:
         "usage": usage,
         "context": context,
         "completion": completion,
+        "context_budget_chars": context_budget_chars,
+        "context_compactions": context_compactions,
+        "compaction_before_characters": compaction_before_characters,
+        "compaction_after_characters": compaction_after_characters,
+        "model_request_count": model_request_count,
+        "max_model_request_characters": max_model_request_characters,
+        "total_model_request_characters": total_model_request_characters,
     }
+
+
+def _empty_trace_summary() -> dict[str, Any]:
+    context = {
+        "strategy": None,
+        "characters": None,
+        "budget_chars": None,
+        "compactions": 0,
+        "compaction_before_characters": 0,
+        "compaction_after_characters": 0,
+        "model_request_count": 0,
+        "max_model_request_characters": 0,
+        "total_model_request_characters": 0,
+    }
+    return {
+        "exists": False,
+        "event_count": 0,
+        "tool_calls": {},
+        "files_changed": [],
+        "usage": {},
+        "context": context,
+        "completion": {},
+        "context_budget_chars": None,
+        "context_compactions": 0,
+        "compaction_before_characters": 0,
+        "compaction_after_characters": 0,
+        "model_request_count": 0,
+        "max_model_request_characters": 0,
+        "total_model_request_characters": 0,
+    }
+
+
+def _stable_json_characters(value: Any) -> int:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        encoded = str(value)
+    return len(encoded)
+
+
+def _nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed >= 0 else 0
 
 
 def _case_failure_reasons(
@@ -658,6 +827,7 @@ def _runner_failure_result(
     exc: Exception,
     *,
     context_strategy: str = "search",
+    context_budget_chars: int | None = None,
 ) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     result_path = run_dir / "result.json"
@@ -677,6 +847,13 @@ def _runner_failure_result(
         "run_id": run_id,
         "mode": mode,
         "context_strategy": context_strategy,
+        "context_budget_chars": context_budget_chars,
+        "context_compactions": 0,
+        "compaction_before_characters": 0,
+        "compaction_after_characters": 0,
+        "model_request_count": 0,
+        "max_model_request_characters": 0,
+        "total_model_request_characters": 0,
         "passed": False,
         "duration_seconds": duration_seconds,
         "criteria": criteria,
@@ -690,14 +867,7 @@ def _runner_failure_result(
         },
         "baseline": {"exit_code": None},
         "verification": {"exit_code": None},
-        "trace": {
-            "exists": False,
-            "event_count": 0,
-            "tool_calls": {},
-            "files_changed": [],
-            "usage": {},
-            "completion": {},
-        },
+        "trace": _empty_trace_summary(),
         "workspace_changes": {
             "allowed_paths": None,
             "changed_paths": [],
@@ -726,10 +896,28 @@ def _suite_case_summary(case_name: str, result: dict[str, Any]) -> dict[str, Any
         "passed": bool(result.get("passed")),
         "steps": trace.get("steps"),
         "duration_seconds": result.get("duration_seconds"),
+        "context_budget_chars": result.get(
+            "context_budget_chars",
+            trace.get("context_budget_chars"),
+        ),
         "tool_calls": dict(trace.get("tool_calls", {})),
         "usage": dict(trace.get("usage", {})),
         "context": dict(trace.get("context", {})),
         "completion": dict(trace.get("completion", {})),
+        "context_compactions": trace.get("context_compactions", 0),
+        "compaction_before_characters": trace.get(
+            "compaction_before_characters", 0
+        ),
+        "compaction_after_characters": trace.get(
+            "compaction_after_characters", 0
+        ),
+        "model_request_count": trace.get("model_request_count", 0),
+        "max_model_request_characters": trace.get(
+            "max_model_request_characters", 0
+        ),
+        "total_model_request_characters": trace.get(
+            "total_model_request_characters", 0
+        ),
         "files_changed": list(
             workspace_changes.get("changed_paths") or trace.get("files_changed", [])
         ),
@@ -755,6 +943,13 @@ def _print_case_summary(result: dict[str, Any]) -> None:
     print(f"  受保护文件未变: {criteria['protected_files_unchanged']}")
     print(f"  改动路径合规: {criteria['allowed_changed_paths_respected']}")
     print(f"  工具调用: {trace.get('tool_calls', {})}")
+    print(
+        "  上下文指标: "
+        f"budget={result.get('context_budget_chars')} "
+        f"compactions={trace.get('context_compactions', 0)} "
+        f"requests={trace.get('model_request_count', 0)} "
+        f"chars={trace.get('total_model_request_characters', 0)}"
+    )
     print(f"  模型用量: {trace.get('usage', {})}")
     print(f"  完成契约拒绝次数: {trace.get('completion', {}).get('rejections', 0)}")
     print(f"  改动文件: {changes.get('changed_paths', [])}")
@@ -788,6 +983,13 @@ def _print_suite_summary(result: dict[str, Any]) -> None:
         print(f"    产物: {item['artifact_path']}")
     print(f"  汇总工具调用: {result['tool_calls']}")
     print(f"  汇总首次上下文字符数: {result.get('context_characters', 0)}")
+    print(
+        "  汇总压缩/模型字符: "
+        f"{result.get('context_compactions', 0)} 次，"
+        f"{result.get('compaction_before_characters', 0)} → "
+        f"{result.get('compaction_after_characters', 0)}；"
+        f"请求 {result.get('total_model_request_characters', 0)}"
+    )
     print(f"  汇总完成契约拒绝次数: {result.get('completion_rejections', 0)}")
     print(f"  汇总模型用量: {result.get('usage', {})}")
     print(f"  总耗时: {result['total_duration_seconds']:.3f}s")

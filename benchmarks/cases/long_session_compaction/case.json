@@ -1,0 +1,16 @@
+{
+  "id": "long-session-compaction-001",
+  "title": "长会话发票汇总数量错误",
+  "task": "修复发票行汇总遗漏数量的问题。请先搜索并阅读 invoice_summary.py、测试和 history_archive.txt，再定位根因；只修改 invoice_summary.py，不要修改测试、AGENTS.md 或历史资料。完成后使用以下命令验证：{{TEST_COMMAND}}",
+  "test_file": "test_invoice_summary.py",
+  "protected_paths": [
+    "test_invoice_summary.py",
+    "AGENTS.md",
+    "history_archive.txt"
+  ],
+  "allowed_changed_paths": [
+    "invoice_summary.py"
+  ],
+  "max_steps": 12,
+  "max_duration_seconds": 120
+}

@@ -1,0 +1,73 @@
+Historical invoice import notes — read-only benchmark context.
+2019-01 batch A: imported 18 records from the north warehouse; quantities were normalized.
+2019-02 batch B: imported 24 records from the east warehouse; currency remained CNY.
+2019-03 batch C: imported 31 records from the west warehouse; duplicate ids were reviewed.
+2019-04 batch D: imported 27 records from the south warehouse; tax fields were retained.
+2019-05 batch E: imported 22 records from the north warehouse; quantities were normalized.
+2019-06 batch F: imported 35 records from the east warehouse; currency remained CNY.
+2019-07 batch G: imported 29 records from the west warehouse; duplicate ids were reviewed.
+2019-08 batch H: imported 41 records from the south warehouse; tax fields were retained.
+2019-09 batch I: imported 16 records from the north warehouse; quantities were normalized.
+2019-10 batch J: imported 38 records from the east warehouse; currency remained CNY.
+2019-11 batch K: imported 26 records from the west warehouse; duplicate ids were reviewed.
+2019-12 batch L: imported 33 records from the south warehouse; tax fields were retained.
+2020-01 batch M: imported 44 records from the north warehouse; quantities were normalized.
+2020-02 batch N: imported 19 records from the east warehouse; currency remained CNY.
+2020-03 batch O: imported 37 records from the west warehouse; duplicate ids were reviewed.
+2020-04 batch P: imported 28 records from the south warehouse; tax fields were retained.
+2020-05 batch Q: imported 45 records from the north warehouse; quantities were normalized.
+2020-06 batch R: imported 32 records from the east warehouse; currency remained CNY.
+2020-07 batch S: imported 21 records from the west warehouse; duplicate ids were reviewed.
+2020-08 batch T: imported 39 records from the south warehouse; tax fields were retained.
+2020-09 batch U: imported 17 records from the north warehouse; quantities were normalized.
+2020-10 batch V: imported 36 records from the east warehouse; currency remained CNY.
+2020-11 batch W: imported 25 records from the west warehouse; duplicate ids were reviewed.
+2020-12 batch X: imported 42 records from the south warehouse; tax fields were retained.
+2021-01 batch Y: imported 30 records from the north warehouse; quantities were normalized.
+2021-02 batch Z: imported 23 records from the east warehouse; currency remained CNY.
+2021-03 batch AA: imported 34 records from the west warehouse; duplicate ids were reviewed.
+2021-04 batch AB: imported 40 records from the south warehouse; tax fields were retained.
+2021-05 batch AC: imported 20 records from the north warehouse; quantities were normalized.
+2021-06 batch AD: imported 46 records from the east warehouse; currency remained CNY.
+2021-07 batch AE: imported 18 records from the west warehouse; duplicate ids were reviewed.
+2021-08 batch AF: imported 43 records from the south warehouse; tax fields were retained.
+2021-09 batch AG: imported 29 records from the north warehouse; quantities were normalized.
+2021-10 batch AH: imported 35 records from the east warehouse; currency remained CNY.
+2021-11 batch AI: imported 24 records from the west warehouse; duplicate ids were reviewed.
+2021-12 batch AJ: imported 48 records from the south warehouse; tax fields were retained.
+2022-01 batch AK: imported 31 records from the north warehouse; quantities were normalized.
+2022-02 batch AL: imported 27 records from the east warehouse; currency remained CNY.
+2022-03 batch AM: imported 39 records from the west warehouse; duplicate ids were reviewed.
+2022-04 batch AN: imported 22 records from the south warehouse; tax fields were retained.
+2022-05 batch AO: imported 47 records from the north warehouse; quantities were normalized.
+2022-06 batch AP: imported 33 records from the east warehouse; currency remained CNY.
+2022-07 batch AQ: imported 26 records from the west warehouse; duplicate ids were reviewed.
+2022-08 batch AR: imported 44 records from the south warehouse; tax fields were retained.
+2022-09 batch AS: imported 19 records from the north warehouse; quantities were normalized.
+2022-10 batch AT: imported 36 records from the east warehouse; currency remained CNY.
+2022-11 batch AU: imported 28 records from the west warehouse; duplicate ids were reviewed.
+2022-12 batch AV: imported 41 records from the south warehouse; tax fields were retained.
+2023-01 batch AW: imported 32 records from the north warehouse; quantities were normalized.
+2023-02 batch AX: imported 25 records from the east warehouse; currency remained CNY.
+2023-03 batch AY: imported 38 records from the west warehouse; duplicate ids were reviewed.
+2023-04 batch AZ: imported 21 records from the south warehouse; tax fields were retained.
+2023-05 batch BA: imported 49 records from the north warehouse; quantities were normalized.
+2023-06 batch BB: imported 34 records from the east warehouse; currency remained CNY.
+2023-07 batch BC: imported 23 records from the west warehouse; duplicate ids were reviewed.
+2023-08 batch BD: imported 46 records from the south warehouse; tax fields were retained.
+2023-09 batch BE: imported 30 records from the north warehouse; quantities were normalized.
+2023-10 batch BF: imported 37 records from the east warehouse; currency remained CNY.
+2023-11 batch BG: imported 27 records from the west warehouse; duplicate ids were reviewed.
+2023-12 batch BH: imported 43 records from the south warehouse; tax fields were retained.
+2024-01 batch BI: imported 35 records from the north warehouse; quantities were normalized.
+2024-02 batch BJ: imported 29 records from the east warehouse; currency remained CNY.
+2024-03 batch BK: imported 42 records from the west warehouse; duplicate ids were reviewed.
+2024-04 batch BL: imported 24 records from the south warehouse; tax fields were retained.
+2024-05 batch BM: imported 50 records from the north warehouse; quantities were normalized.
+2024-06 batch BN: imported 31 records from the east warehouse; currency remained CNY.
+2024-07 batch BO: imported 26 records from the west warehouse; duplicate ids were reviewed.
+2024-08 batch BP: imported 45 records from the south warehouse; tax fields were retained.
+2024-09 batch BQ: imported 18 records from the north warehouse; quantities were normalized.
+2024-10 batch BR: imported 40 records from the east warehouse; currency remained CNY.
+2024-11 batch BS: imported 33 records from the west warehouse; duplicate ids were reviewed.
+2024-12 batch BT: imported 47 records from the south warehouse; tax fields were retained.
