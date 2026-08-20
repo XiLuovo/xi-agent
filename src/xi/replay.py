@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
-from .events import Event
+from .events import EVENT_SCHEMA_VERSION, LEGACY_EVENT_SCHEMA_VERSION, Event
 
 
 class ReplayError(ValueError):
@@ -24,6 +24,8 @@ class ReplayError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ReplaySummary:
+    """Session-level summary with ``run_id`` pointing at the latest Run."""
+
     run_id: str
     task: str
     status: str
@@ -35,6 +37,13 @@ class ReplaySummary:
     events: int
     final_text: str = ""
     error: str | None = None
+    session_id: str = ""
+    run_ids: tuple[str, ...] = ()
+    run_count: int = 0
+
+    @property
+    def runs(self) -> int:
+        return self.run_count or len(self.run_ids) or 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +89,9 @@ def load_trace(path: str | Path) -> ReplayTrace:
 
     events: list[Event] = []
     seen_event_ids: set[str] = set()
-    run_id: str | None = None
+    session_id: str | None = None
+    run_ids: list[str] = []
+    seen_run_ids: set[str] = set()
     try:
         handle = source.open("r", encoding="utf-8", newline="")
     except OSError as exc:
@@ -107,12 +118,16 @@ def load_trace(path: str | Path) -> ReplayTrace:
                         raise ReplayError(
                             f"第 {line_number} 行 parent_id 未指向此前事件: {event.parent_id}"
                         )
-                if run_id is None:
-                    run_id = event.run_id
-                elif event.run_id != run_id:
+                if session_id is None:
+                    session_id = event.session_id
+                elif event.session_id != session_id:
                     raise ReplayError(
-                        f"第 {line_number} 行包含多个 run_id；已有 {run_id}，发现 {event.run_id}"
+                        f"第 {line_number} 行包含多个 session_id；"
+                        f"已有 {session_id}，发现 {event.session_id}"
                     )
+                if event.run_id not in seen_run_ids:
+                    seen_run_ids.add(event.run_id)
+                    run_ids.append(event.run_id)
                 seen_event_ids.add(event.event_id)
                 events.append(event)
     except UnicodeDecodeError as exc:
@@ -120,9 +135,9 @@ def load_trace(path: str | Path) -> ReplayTrace:
     except OSError as exc:
         raise ReplayError(f"读取 trace 时发生 I/O 错误: {exc}") from exc
 
-    if not events or run_id is None:
+    if not events or session_id is None or not run_ids:
         raise ReplayError("trace 为空；至少需要一条事件")
-    summary = _summarize(events, run_id)
+    summary = _summarize(events, session_id, tuple(run_ids))
     return ReplayTrace(source=source, events=tuple(events), summary=summary)
 
 
@@ -140,8 +155,11 @@ def render_trace(trace: ReplayTrace, *, max_text: int = 180) -> str:
     lines = [
         "Xi Trace Replay（离线只读：不会调用模型、工具或命令）",
         f"trace: {_clip(str(trace.source), limit)}",
-        f"run_id: {_clip(summary.run_id, limit)}",
-        f"task: {_clip(summary.task, limit)}",
+        f"session_id: {_clip(summary.session_id, limit)}",
+        f"runs: {summary.runs}",
+        f"run_ids: {_format_run_ids(summary.run_ids, limit)}",
+        f"latest_run_id: {_clip(summary.run_id, limit)}",
+        f"latest_task: {_clip(summary.task, limit)}",
         "",
         "时间线:",
     ]
@@ -186,6 +204,21 @@ def _parse_event(raw: Mapping[str, Any], line_number: int) -> Event:
     run_id = data.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
         raise ReplayError(f"第 {line_number} 行缺少有效 run_id")
+    schema_version = data.get("schema_version", LEGACY_EVENT_SCHEMA_VERSION)
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise ReplayError(f"第 {line_number} 行 schema_version 必须是整数")
+    if schema_version not in {LEGACY_EVENT_SCHEMA_VERSION, EVENT_SCHEMA_VERSION}:
+        raise ReplayError(
+            f"第 {line_number} 行 schema_version={schema_version} 不受支持"
+        )
+    session_id = data.get("session_id")
+    if schema_version >= EVENT_SCHEMA_VERSION:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ReplayError(f"第 {line_number} 行 v2 事件缺少有效 session_id")
+    elif session_id is None:
+        session_id = run_id
+    elif not isinstance(session_id, str) or not session_id.strip():
+        raise ReplayError(f"第 {line_number} 行 session_id 必须是非空字符串")
     parent_id = data.get("parent_id")
     if parent_id == "":
         parent_id = None
@@ -205,6 +238,8 @@ def _parse_event(raw: Mapping[str, Any], line_number: int) -> Event:
     normalized["type"] = event_type
     normalized["event_id"] = event_id
     normalized["run_id"] = run_id
+    normalized["session_id"] = session_id
+    normalized["schema_version"] = schema_version
     normalized["parent_id"] = parent_id
     normalized["payload"] = _redact_value(dict(payload))
     # Event.from_dict() otherwise fills a missing timestamp with "now", which
@@ -218,14 +253,19 @@ def _parse_event(raw: Mapping[str, Any], line_number: int) -> Event:
         raise ReplayError(f"第 {line_number} 行事件字段无效: {exc}") from exc
 
 
-def _summarize(events: list[Event], run_id: str) -> ReplaySummary:
+def _summarize(
+    events: list[Event],
+    session_id: str,
+    run_ids: tuple[str, ...],
+) -> ReplaySummary:
     tool_calls: Counter[str] = Counter()
     policy_decisions: Counter[str] = Counter()
     changed_files: list[str] = []
     changed_seen: set[str] = set()
     task = ""
     status = "incomplete"
-    steps = 0
+    run_steps: list[int] = []
+    run_durations: list[float] = []
     duration: float | None = None
     final_text = ""
     error: str | None = None
@@ -234,10 +274,19 @@ def _summarize(events: list[Event], run_id: str) -> ReplaySummary:
         payload = event.payload
         if not isinstance(payload, Mapping):
             continue
-        task = task or _as_text(payload.get("task"))
+        if event.type == "run_started":
+            run_steps.append(0)
+            event_task = _as_text(payload.get("task"))
+            if event_task:
+                task = event_task
+            status = "incomplete"
+            final_text = ""
+            error = None
         step_value = _as_nonnegative_int(payload.get("step"))
         if step_value is not None:
-            steps = max(steps, step_value)
+            if not run_steps:
+                run_steps.append(0)
+            run_steps[-1] = max(run_steps[-1], step_value)
         if event.type == "tool_proposed":
             tool_name = _as_text(payload.get("tool")) or "<unknown>"
             tool_calls[tool_name] += 1
@@ -251,18 +300,33 @@ def _summarize(events: list[Event], run_id: str) -> ReplaySummary:
                 changed_files.append(path)
         elif event.type == "run_finished":
             status = "success" if payload.get("success", True) else "failed"
-            steps = max(steps, _as_nonnegative_int(payload.get("steps")) or 0)
-            duration = _as_nonnegative_float(payload.get("duration_seconds"))
+            if not run_steps:
+                run_steps.append(0)
+            run_steps[-1] = max(
+                run_steps[-1], _as_nonnegative_int(payload.get("steps")) or 0
+            )
+            event_duration = _as_nonnegative_float(payload.get("duration_seconds"))
+            if event_duration is not None:
+                run_durations.append(event_duration)
             final_text = _as_text(payload.get("text"))
+            error = None
         elif event.type == "run_failed":
             status = "failed"
-            steps = max(steps, _as_nonnegative_int(payload.get("steps")) or 0)
+            if not run_steps:
+                run_steps.append(0)
+            run_steps[-1] = max(
+                run_steps[-1], _as_nonnegative_int(payload.get("steps")) or 0
+            )
             error = _as_text(payload.get("error")) or None
         elif event.type == "model_responded" and not final_text:
             # Useful for incomplete traces that ended after a model response.
             final_text = _as_text(payload.get("text"))
 
-    if duration is None:
+    steps = sum(run_steps)
+    run_count = len(run_steps) or 1
+    if run_durations and len(run_durations) == run_count:
+        duration = sum(run_durations)
+    elif run_count == 1:
         start = _parse_timestamp(events[0].timestamp)
         end = _parse_timestamp(events[-1].timestamp)
         if start is not None and end is not None:
@@ -273,7 +337,7 @@ def _summarize(events: list[Event], run_id: str) -> ReplaySummary:
                 # but cannot produce a trustworthy elapsed duration.
                 duration = None
     return ReplaySummary(
-        run_id=run_id,
+        run_id=run_ids[-1],
         task=task,
         status=status,
         steps=steps,
@@ -284,6 +348,9 @@ def _summarize(events: list[Event], run_id: str) -> ReplaySummary:
         events=len(events),
         final_text=final_text,
         error=error,
+        session_id=session_id,
+        run_ids=run_ids,
+        run_count=run_count,
     )
 
 
@@ -291,7 +358,11 @@ def _event_line(event: Event, limit: int) -> str:
     payload = event.payload if isinstance(event.payload, Mapping) else {}
     event_type = event.type
     if event_type == "run_started":
-        return f"[run_started] task={_clip(_as_text(payload.get('task')), limit)}"
+        parent = _clip(event.parent_id or "-", 16)
+        return (
+            f"[run_started] run_id={_clip(event.run_id, 16)} "
+            f"parent={parent} task={_clip(_as_text(payload.get('task')), limit)}"
+        )
     if event_type == "model_requested":
         tools = payload.get("tools") or []
         tool_text = ",".join(_clip(_as_text(item), 40) for item in tools) or "-"
@@ -386,6 +457,12 @@ def _format_counts(values: Mapping[str, int]) -> str:
     if not values:
         return "0"
     return ", ".join(f"{key}={value}" for key, value in values.items())
+
+
+def _format_run_ids(run_ids: tuple[str, ...], limit: int) -> str:
+    if not run_ids:
+        return "无"
+    return _clip(" -> ".join(run_ids), max(limit, 100))
 
 
 def _format_files(files: tuple[str, ...], limit: int) -> str:

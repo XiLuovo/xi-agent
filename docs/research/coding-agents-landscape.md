@@ -239,7 +239,7 @@ context_compacted
 run_finished / run_failed
 ```
 
-每条事件至少带 `run_id`、`event_id`、`parent_id`、timestamp、payload 和 usage。`parent_id` 让工具调用、子任务和分支保持因果关系。第一版不必实现完整事件溯源数据库，JSONL 足够；但写入必须 append-only，模型上下文应由事件投影生成。
+每条事件至少带 `session_id`、`run_id`、`event_id`、`parent_id`、timestamp、payload 和 usage。`session_id` 标识稳定会话，`run_id` 标识一次独立执行，`parent_id` 让工具调用、子任务和分支保持因果关系。第一版不必实现完整事件溯源数据库，JSONL 足够；但写入必须 append-only，模型上下文应由事件投影生成。
 
 ### 6.3 Policy 与 Executor 分层
 

@@ -16,7 +16,8 @@ from typing import Any, Callable, Iterable, Protocol
 from uuid import uuid4
 
 
-EVENT_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 2
+LEGACY_EVENT_SCHEMA_VERSION = 1
 
 
 def _now() -> str:
@@ -40,6 +41,14 @@ class Event:
     timestamp: str = field(default_factory=_now)
     usage: dict[str, Any] | None = None
     schema_version: int = EVENT_SCHEMA_VERSION
+    # v1 traces did not carry a session id.  Keeping this optional at the
+    # dataclass seam lets callers still construct legacy-shaped events while
+    # ``__post_init__`` gives them the deterministic compatibility identity.
+    session_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            self.session_id = self.run_id
 
     @property
     def event_type(self) -> str:
@@ -62,8 +71,12 @@ class Event:
         data = dict(value)
         if "type" not in data and "event_type" in data:
             data["type"] = data.pop("event_type")
-        data.setdefault("schema_version", EVENT_SCHEMA_VERSION)
+        # A missing schema marker predates the explicit v2 field.  Treat it as
+        # v1 and derive the session identity from the run identity below.
+        data.setdefault("schema_version", LEGACY_EVENT_SCHEMA_VERSION)
         data.setdefault("payload", {})
+        if not data.get("session_id") and data.get("run_id"):
+            data["session_id"] = data["run_id"]
         allowed = {
             "type",
             "run_id",
@@ -73,6 +86,7 @@ class Event:
             "timestamp",
             "usage",
             "schema_version",
+            "session_id",
         }
         return cls(**{key: item for key, item in data.items() if key in allowed})
 
@@ -188,6 +202,7 @@ MemoryStore = MemorySessionStore
 
 __all__ = [
     "EVENT_SCHEMA_VERSION",
+    "LEGACY_EVENT_SCHEMA_VERSION",
     "Event",
     "EventCollection",
     "SessionStore",

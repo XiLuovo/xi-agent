@@ -38,12 +38,17 @@ class SessionProjection:
     """
 
     source: Path
+    # The most recent Run already present in the Trace. A resumed turn uses a
+    # new run_id while keeping the Session identity stable.
     run_id: str
     workspace: Path
     messages: tuple[dict[str, Any], ...]
     last_event_id: str
     context_strategy: str
     turns: int
+    # Kept at the end with a default so existing positional construction of
+    # the public projection object remains compatible.
+    session_id: str = ""
 
 
 def project_session(path: str | Path) -> SessionProjection:
@@ -123,6 +128,7 @@ def project_session(path: str | Path) -> SessionProjection:
         context_strategy = "search"
     return SessionProjection(
         source=trace.source,
+        session_id=trace.summary.session_id,
         run_id=trace.summary.run_id,
         workspace=workspace,
         messages=tuple(deepcopy(messages)),

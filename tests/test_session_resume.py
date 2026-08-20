@@ -13,7 +13,7 @@ from xi.runtime import AgentRuntime
 from xi.session import project_session
 
 
-def test_cli_resume_projects_context_and_continues_same_event_stream(
+def test_cli_resume_upgrades_legacy_trace_into_distinct_runs_in_one_session(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -31,8 +31,21 @@ def test_cli_resume_projects_context_and_continues_same_event_stream(
         )
 
     assert first_result.success is True
+    legacy_events = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for event in legacy_events:
+        event.pop("session_id", None)
+        event["schema_version"] = 1
+    trace_path.write_text(
+        "\n".join(json.dumps(event, ensure_ascii=False) for event in legacy_events) + "\n",
+        encoding="utf-8",
+    )
     first_trace = load_trace(trace_path)
     first_final_id = first_trace.events[-1].event_id
+    assert first_trace.summary.session_id == first_result.run_id
+    assert first_trace.summary.run_ids == (first_result.run_id,)
 
     script_path = tmp_path / "resume-script.json"
     script_path.write_text(
@@ -57,7 +70,13 @@ def test_cli_resume_projects_context_and_continues_same_event_stream(
     resumed_trace = load_trace(trace_path)
     started_events = [event for event in resumed_trace.events if event.type == "run_started"]
     assert len(started_events) == 2
-    assert {event.run_id for event in resumed_trace.events} == {first_result.run_id}
+    resumed_run_id = started_events[1].run_id
+    assert resumed_run_id != first_result.run_id
+    assert resumed_trace.summary.session_id == first_result.run_id
+    assert resumed_trace.summary.run_ids == (first_result.run_id, resumed_run_id)
+    assert resumed_trace.summary.runs == 2
+    assert {event.session_id for event in resumed_trace.events} == {first_result.run_id}
+    assert {event.schema_version for event in resumed_trace.events} == {1, 2}
     assert started_events[1].parent_id == first_final_id
     assert started_events[1].payload["session_continued"] is True
 
@@ -74,6 +93,8 @@ def test_cli_resume_projects_context_and_continues_same_event_stream(
     assert "基于上一轮继续" in contents
 
     projection = project_session(trace_path)
+    assert projection.session_id == first_result.run_id
+    assert projection.run_id == resumed_run_id
     assert projection.turns == 2
     assert projection.messages[-1] == {
         "role": "assistant",

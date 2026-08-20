@@ -34,6 +34,7 @@ class RunResult:
     steps: int
     trace_events: list[Event] = field(default_factory=list)
     error: str | None = None
+    session_id: str = ""
 
 
 class AgentRuntime:
@@ -61,6 +62,7 @@ class AgentRuntime:
         auto_approve: bool = False,
         approval_callback: Callable[[str, Mapping[str, Any], PolicyDecision], bool] | None = None,
         max_observation_chars: int = 12_000,
+        session_id: str | None = None,
     ) -> None:
         self.model = model
         self.workspace = Path(workspace).expanduser().resolve()
@@ -92,12 +94,18 @@ class AgentRuntime:
         self.approval_callback = approval_callback
         self.max_observation_chars = max(int(max_observation_chars), 256)
         self._conversation: list[dict[str, Any]] = []
-        self._session_run_id: str | None = None
+        self._session_id = session_id or uuid4().hex
         self._session_parent_id: str | None = None
 
     @property
     def conversation(self) -> list[dict[str, Any]]:
         return deepcopy(self._conversation)
+
+    @property
+    def session_id(self) -> str:
+        """Stable identity for the in-memory Session lineage."""
+
+        return self._session_id
 
     def reset_conversation(self) -> None:
         self._conversation.clear()
@@ -118,7 +126,7 @@ class AgentRuntime:
         if projection.last_event_id not in stored_event_ids:
             raise ValueError("当前 session store 不包含待恢复 trace 的最后事件")
         self._conversation = deepcopy(list(projection.messages))
-        self._session_run_id = projection.run_id
+        self._session_id = projection.session_id or projection.run_id
         self._session_parent_id = projection.last_event_id
 
     def close(self) -> None:
@@ -146,11 +154,9 @@ class AgentRuntime:
         is_interactive = self.interactive if interactive is None else interactive
         approve = approval_callback or self.approval_callback
         is_session_run = bool(continue_session)
-        run_id = (
-            self._session_run_id
-            if is_session_run and self._session_run_id is not None
-            else uuid4().hex
-        )
+        # Every user turn is a distinct Run.  Continuing a Session reuses only
+        # the Session identity and the prior event as causal parent.
+        run_id = uuid4().hex
         session_parent_id = self._session_parent_id if is_session_run else None
         run_events: list[Event] = []
         started_at = time.monotonic()
@@ -165,6 +171,7 @@ class AgentRuntime:
             event = Event(
                 type=event_type,
                 run_id=run_id,
+                session_id=self._session_id,
                 parent_id=parent_id,
                 payload=_json_safe(dict(payload or {})),
                 usage=_json_safe(dict(usage)) if usage else None,
@@ -327,11 +334,18 @@ class AgentRuntime:
                     )
                     if continue_session:
                         self._conversation = deepcopy(messages)
-                        self._session_run_id = run_id
                         self._session_parent_id = finished_event.event_id
                     else:
                         self._conversation = []
-                    return RunResult(run_id, task, final_text, True, step, run_events)
+                    return RunResult(
+                        run_id,
+                        task,
+                        final_text,
+                        True,
+                        step,
+                        run_events,
+                        session_id=self._session_id,
+                    )
 
                 for call in response.tool_calls:
                     proposal = emit(
@@ -487,11 +501,19 @@ class AgentRuntime:
         )
         if continue_session:
             self._conversation = deepcopy([dict(message) for message in messages])
-            self._session_run_id = run_id
             self._session_parent_id = failed_event.event_id
         else:
             self._conversation = []
-        return RunResult(run_id, task, error, False, steps, run_events, error=error)
+        return RunResult(
+            run_id,
+            task,
+            error,
+            False,
+            steps,
+            run_events,
+            error=error,
+            session_id=self._session_id,
+        )
 
     run_task = run
 

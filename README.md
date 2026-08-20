@@ -16,6 +16,7 @@ Xi 当前已经具备一个可运行、可研究的最小闭环：
 - 支持代码搜索、文件读取、补丁修改和测试命令执行；
 - 记录可审计的 JSONL 事件 Trace，并支持离线回放；
 - 支持从 Trace 恢复上下文并继续执行；
+- 使用 Session Schema v2 区分稳定的 `session_id` 与每轮独立的 `run_id`；
 - 提供基于证据的完成契约，避免模型只描述修改而没有真正执行；
 - 提供 `search` 与 `repo-map` 两种上下文策略和可重复 Benchmark。
 
@@ -155,7 +156,8 @@ Headless 模式中，未知命令默认拒绝；固定评测请用 `--allow-comm
 
 正常完成的 trace 可以恢复成模型对话并继续执行。`resume` 默认使用 trace 中记录的
 工作区，并继续向原 JSONL 文件追加事件；新的 `run_started` 会把上一条事件作为
-`parent_id`，同一会话也会保持同一个 `run_id`：
+`parent_id`。同一会话保持稳定的 `session_id`，每次用户输入都会创建独立的
+`run_id`：
 
 ```powershell
 # 恢复后进入自然语言交互
@@ -166,8 +168,9 @@ xi resume .xi\traces\20260820-120000-abcd1234.jsonl -p "继续完成剩余工作
 ```
 
 Session Projection 会从事件流中恢复最近一次发送给模型的消息，并合入该轮最终响应。
-当前最小版本只恢复正常完成且保存了 `model_requested.messages` 的 trace；失败会话、
-fork 和 compaction 留在后续阶段。
+旧版 v1 Trace 没有 `session_id` 时，会用其原有 `run_id` 推导会话身份；恢复后新增的
+事件会按 v2 格式继续写入。当前版本只恢复正常完成且保存了
+`model_requested.messages` 的 trace；失败会话、fork 和 compaction 留在后续阶段。
 
 ## Trace 回放（Trace Replay）
 
@@ -179,12 +182,12 @@ xi replay .xi\benchmarks\order-total-quantity-001\20260820-085219-19e2a9f3\trace
 
 Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运行摘要；它不会
 调用模型、执行工具或命令，也不会修改工作区，因此不是 resume 或重新执行。
-回放会检查 JSON 合法性、单一 `run_id`、唯一 `event_id`，以及按顺序可解析的
-`parent_id`。损坏的 trace 会以非零退出码报告错误。
+回放会显示会话 ID、运行轮数与各轮连接关系，并检查 JSON 合法性、单一
+`session_id`、唯一 `event_id`，以及按顺序可解析的 `parent_id`。一个 v2 Trace 可包含
+多个 `run_id`；旧版单轮 v1 Trace 仍可回放。损坏的 trace 会以非零退出码报告错误。
 
 ## 后续路线
 
-- Session Schema v2：区分整个会话的 `session_id` 与每轮执行的 `run_id`；
 - Session Fork：从历史事件节点创建独立分支；
 - 失败或中断会话恢复；
 - 长会话上下文压缩（Compaction）及对应实验；
