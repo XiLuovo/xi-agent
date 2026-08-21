@@ -166,6 +166,21 @@ Live Suite 会调用真实模型，本地确定性验证应使用 scripted。详
 [上下文压缩实验](docs/experiments/context-compaction.md)；这仍是内部评测基础设施，
 普通用户继续使用 `xi` 与 `xi -p "任务"`。
 
+执行隔离 A/B 实验复用同一套 Core Suite、ScriptedModel 轨迹、Policy 与 AgentRuntime，
+只切换 Agent 的命令执行后端，并生成 JSON/Markdown 对照报告：
+
+```powershell
+.\.venv\Scripts\python.exe benchmarks\execution.py --mode scripted --suite core
+```
+
+实验默认比较 `local` 与使用 `python:3.11-slim` 的 `docker`。Docker 条件会把 Case 的
+唯一测试命令适配为 Linux 容器内的 `python -m unittest ...`；baseline 和最终
+verification 仍在宿主机运行，并在结果中与 Agent 命令位置明确区分。报告记录成功率、
+步骤、工具调用、Agent/总耗时、Docker 失败、fallback，以及 local→docker 的差值与耗时
+开销。研究设计和实际 scripted 结果见
+[执行隔离评测](docs/experiments/execution-isolation.md)。这是执行后端 A/B，不是 Docker
+绝对安全性证明，也不包含独立的宿主环境变量泄露实验。
+
 ## 安全边界
 
 Xi 将“是否允许工具调用”的 Policy 与“如何执行操作”的 Executor 分开。默认

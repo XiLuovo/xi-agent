@@ -108,6 +108,61 @@ Compare 会为每种策略统计 Case 成功率、整套 Suite 通过率，以�
 `--case` 与 `--suite` 互斥。Live 模式读取项目根目录的 `.env`，可能产生真实
 API 调用与费用；Scripted 模式完全离线。
 
+## 执行后端与隔离 A/B
+
+`run.py` 默认继续使用 `local` Executor。也可以只把 Agent 的 `run_command` 切换到
+Docker；Case 的 baseline 和最终 verification 仍由宿主机 Python 执行并在结果中明确
+标记为 `host`：
+
+```powershell
+# 默认本地后端
+.\.venv\Scripts\python.exe benchmarks\run.py --suite core --mode scripted --executor local
+
+# Docker 后端；Core fixture 只依赖标准库，因此可直接使用该镜像
+.\.venv\Scripts\python.exe benchmarks\run.py --suite core --mode scripted `
+  --executor docker --docker-image python:3.11-slim
+```
+
+Docker 条件使用容器内的 `python -m unittest ...`，不会把 Windows 的
+`.venv\Scripts\python.exe` 路径传入 Linux 容器。两种条件复用相同 Case、自然语言任务
+模板、ScriptedModel 响应模板、Policy 规则、AgentRuntime 和评分逻辑；只有唯一测试命令
+占位符会被适配为对应执行环境可运行的等价命令。
+
+`execution.py` 是现有 Runner 外的一层薄编排器，默认对同一个 Core Suite 顺序运行
+`local` 与 `docker` 两个独立条件：
+
+```powershell
+.\.venv\Scripts\python.exe benchmarks\execution.py --mode scripted --suite core
+
+# 可选：单 Case 或指定镜像/产物根目录
+.\.venv\Scripts\python.exe benchmarks\execution.py --mode scripted `
+  --case order_total_quantity `
+  --docker-image python:3.11-slim `
+  --output-root .xi\benchmark-execution
+```
+
+编排器不会复制 Case 执行或评分逻辑。它读取每个条件唯一的 `result.json`，校验结果与
+Trace 记录的 Executor，生成成功率、Agent/verification 状态、步骤、工具调用、Agent
+耗时、包含宿主评分在内的总耗时、Docker 命令失败和 fallback 计数，以及
+local→docker 的差值与耗时开销百分比。Runner 非零、结果缺失或 JSON 损坏都会保留为
+明确失败；Docker 条件绝不会切换到 local 伪装成功。
+
+```text
+.xi/benchmark-execution/core/<experiment-id>/
+├── local/                    # 独立 run.py Suite 产物
+├── docker/                   # 独立 run.py Suite 产物
+├── report.json
+└── report.md
+```
+
+运行 Docker 条件需要可用的 Docker CLI、Linux daemon、镜像，以及 Windows Docker
+Desktop 对当前工作区盘符的 bind mount 权限。`python:3.11-slim` 足以运行当前纯标准库
+Core fixture，因此 v1 不维护重复的 Benchmark Dockerfile。报告只比较执行后端，不把
+宿主机 baseline/verification 称为容器验证，也不证明 Docker 是绝对安全沙箱。容器默认
+断网并受资源限制，但工作区以读写方式挂载，工作区内的 `.env` 或其他凭据文件仍可能
+可见。本实验没有独立的环境变量泄露探针，因此不会作“所有宿主环境变量均不可见”的
+额外结论。
+
 ## 长会话上下文压缩 Case
 
 `long_session_compaction` 是独立于 Core Suite 的长会话研究 Case：fixture 包含一个
@@ -176,7 +231,9 @@ Suite 产物采用稳定布局：
 
 Suite 的 `result.json` 记录上下文策略、总 Case 数、通过/失败数、成功率、总耗时、
 汇总工具调用、模型 token 用量，以及每个 Case 的步骤、上下文大小、耗时、改动文件、
-失败标准/原因和产物路径。
+失败标准/原因和产物路径。执行后端运行还会记录 `executor`、`docker_image`、Agent 与
+baseline/verification 的执行位置、Agent/总耗时、Docker 命令与失败数、`fallback_count`
+以及各 Case Trace 实际记录的后端；旧结果缺少这些字段时，读取方仍按 local/零计数兼容。
 
 Compare 产物按一次实验隔离：
 

@@ -73,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="显式启用上下文压缩的字符预算；默认关闭（不是 token 计数）",
     )
     parser.add_argument(
+        "--executor",
+        choices=("local", "docker"),
+        default="local",
+        help="Agent 命令执行后端；baseline 与最终评分始终在宿主机运行",
+    )
+    parser.add_argument(
+        "--docker-image",
+        help="Docker Agent 使用的 Linux 镜像；仅用于 --executor docker",
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=PROJECT_ROOT / ".xi" / "benchmarks",
@@ -84,7 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     _configure_windows_utf8_streams()
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.docker_image and args.executor != "docker":
+        parser.error("--docker-image 仅用于 --executor docker")
     try:
         if args.suite:
             result = _run_suite(
@@ -93,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.output_root,
                 context_strategy=args.context_strategy,
                 context_budget_chars=args.context_budget_chars,
+                executor=args.executor,
+                docker_image=args.docker_image,
             )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False))
@@ -105,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.output_root,
                 context_strategy=args.context_strategy,
                 context_budget_chars=args.context_budget_chars,
+                executor=args.executor,
+                docker_image=args.docker_image,
             )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False))
@@ -122,6 +139,8 @@ def _run_case(
     *,
     context_strategy: str = "search",
     context_budget_chars: int | None = None,
+    executor: str = "local",
+    docker_image: str | None = None,
     run_dir: Path | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
@@ -140,9 +159,12 @@ def _run_case(
 
     test_file = str(manifest["test_file"])
     _require_workspace_file(workspace, test_file, "test_file")
-    test_args = [sys.executable, "-m", "unittest", "-q", test_file]
-    test_command = _format_command(test_args)
-    task = str(manifest["task"]).replace("{{TEST_COMMAND}}", test_command)
+    host_test_args = [sys.executable, "-m", "unittest", "-q", test_file]
+    host_test_command = _format_command(host_test_args)
+    agent_test_command = _agent_test_command(executor, test_file)
+    agent_command_location = "docker-container" if executor == "docker" else "host"
+    requested_docker_image = docker_image if executor == "docker" else None
+    task = str(manifest["task"]).replace("{{TEST_COMMAND}}", agent_test_command)
     protected_paths = _manifest_path_list(manifest, "protected_paths") or []
     allowed_changed_paths = _manifest_path_list(manifest, "allowed_changed_paths")
     for relative in [*protected_paths, *(allowed_changed_paths or [])]:
@@ -150,7 +172,7 @@ def _run_case(
     environment = _subprocess_environment()
     case_started_at = time.monotonic()
 
-    baseline = _run_verification(test_args, workspace, environment)
+    baseline = _run_verification(host_test_args, workspace, environment)
     protected_before = _hash_paths(workspace, protected_paths)
     workspace_before = _snapshot_workspace(workspace)
 
@@ -165,7 +187,7 @@ def _run_case(
             raise BenchmarkError(f"无法读取 scripted 响应 {source_script}: {exc}") from exc
         if not isinstance(script, list):
             raise BenchmarkError(f"scripted 响应必须是 JSON 数组: {source_script}")
-        script = _replace_placeholder(script, "{{TEST_COMMAND}}", test_command)
+        script = _replace_placeholder(script, "{{TEST_COMMAND}}", agent_test_command)
         script_path = run_dir / "scripted_responses.json"
         script_path.write_text(
             json.dumps(script, ensure_ascii=False, indent=2) + "\n",
@@ -188,12 +210,16 @@ def _run_case(
         str(manifest.get("max_steps", 12)),
         "--max-duration",
         str(manifest.get("max_duration_seconds", 120)),
+        "--executor",
+        executor,
         "--allow-command",
-        test_command,
+        agent_test_command,
         "--require-file-change",
         "--require-successful-command",
-        test_command,
+        agent_test_command,
     ]
+    if requested_docker_image is not None:
+        command.extend(["--docker-image", requested_docker_image])
     if context_budget_chars is not None:
         command.extend(["--context-budget-chars", str(context_budget_chars)])
     if script_path is not None:
@@ -223,7 +249,7 @@ def _run_case(
         agent_timed_out = True
     agent_duration_seconds = round(time.monotonic() - agent_started_at, 3)
 
-    verification = _run_verification(test_args, workspace, environment)
+    verification = _run_verification(host_test_args, workspace, environment)
     protected_after = _hash_paths(workspace, protected_paths)
     protected_unchanged = protected_before == protected_after
     workspace_after = _snapshot_workspace(workspace)
@@ -236,6 +262,11 @@ def _run_case(
     )
     allowed_paths_respected = allowed_changed_paths is None or not unexpected_paths
     trace_summary = _summarize_trace(trace_path)
+    selected_docker_image = (
+        trace_summary.get("docker_image") or requested_docker_image
+        if executor == "docker"
+        else None
+    )
 
     criteria = {
         "baseline_bug_reproduced": baseline["exit_code"] != 0,
@@ -260,6 +291,8 @@ def _run_case(
         "title": manifest.get("title", case_id),
         "run_id": run_id,
         "mode": mode,
+        "executor": executor,
+        "docker_image": selected_docker_image,
         "context_strategy": context_strategy,
         "context_budget_chars": context_budget_chars,
         "context_compactions": trace_summary.get("context_compactions", 0),
@@ -276,6 +309,12 @@ def _run_case(
         "total_model_request_characters": trace_summary.get(
             "total_model_request_characters", 0
         ),
+        "agent_completed": agent_exit_code == 0,
+        "verification_passed": verification["exit_code"] == 0,
+        "agent_duration_seconds": agent_duration_seconds,
+        "docker_command_count": trace_summary.get("docker_command_count", 0),
+        "docker_failure_count": trace_summary.get("docker_failure_count", 0),
+        "fallback_count": trace_summary.get("fallback_count", 0),
         "passed": passed,
         "duration_seconds": duration_seconds,
         "criteria": criteria,
@@ -284,11 +323,24 @@ def _run_case(
             "exit_code": agent_exit_code,
             "timed_out": agent_timed_out,
             "duration_seconds": agent_duration_seconds,
+            "executor": executor,
+            "test_command": agent_test_command,
+            "execution_location": agent_command_location,
             "stdout": agent_stdout,
             "stderr": agent_stderr,
         },
         "baseline": baseline,
         "verification": verification,
+        "execution": {
+            "agent_executor": executor,
+            "agent_command_location": agent_command_location,
+            "agent_test_command": agent_test_command,
+            "baseline_location": "host",
+            "baseline_command": host_test_command,
+            "verification_location": "host",
+            "verification_command": host_test_command,
+            "docker_image": selected_docker_image,
+        },
         "trace": trace_summary,
         "workspace_changes": {
             "allowed_paths": allowed_changed_paths,
@@ -314,6 +366,8 @@ def _run_suite(
     *,
     context_strategy: str = "search",
     context_budget_chars: int | None = None,
+    executor: str = "local",
+    docker_image: str | None = None,
 ) -> dict[str, Any]:
     manifest = _load_suite(suite_name)
     suite_id = str(manifest["id"])
@@ -343,6 +397,8 @@ def _run_suite(
                 run_dir=case_run_dir,
                 run_id=case_run_id,
                 context_budget_chars=context_budget_chars,
+                executor=executor,
+                docker_image=docker_image,
             )
         except Exception as exc:
             case_result = _runner_failure_result(
@@ -354,6 +410,8 @@ def _run_suite(
                 exc,
                 context_strategy=context_strategy,
                 context_budget_chars=context_budget_chars,
+                executor=executor,
+                docker_image=docker_image,
             )
         case_results.append(case_result)
 
@@ -376,6 +434,13 @@ def _run_suite(
     model_request_count = 0
     max_model_request_characters = 0
     total_model_request_characters = 0
+    agent_duration_seconds = 0.0
+    agent_completed_cases = 0
+    verification_passed_cases = 0
+    docker_command_count = 0
+    docker_failure_count = 0
+    fallback_count = 0
+    selected_docker_images: set[str] = set()
     for item in summaries:
         tool_calls.update(item["tool_calls"])
         characters = item["context"].get("characters")
@@ -397,6 +462,19 @@ def _run_suite(
         total_model_request_characters += _nonnegative_int(
             item.get("total_model_request_characters")
         )
+        agent_duration_seconds += _nonnegative_number(
+            item.get("agent_duration_seconds")
+        )
+        if item.get("agent_completed"):
+            agent_completed_cases += 1
+        if item.get("verification_passed"):
+            verification_passed_cases += 1
+        docker_command_count += _nonnegative_int(item.get("docker_command_count"))
+        docker_failure_count += _nonnegative_int(item.get("docker_failure_count"))
+        fallback_count += _nonnegative_int(item.get("fallback_count"))
+        selected_image = item.get("docker_image")
+        if isinstance(selected_image, str) and selected_image:
+            selected_docker_images.add(selected_image)
         usage.update(
             {
                 key: value
@@ -410,6 +488,12 @@ def _run_suite(
         "suite_id": suite_id,
         "title": manifest.get("title", suite_id),
         "mode": mode,
+        "executor": executor,
+        "docker_image": (
+            next(iter(selected_docker_images))
+            if len(selected_docker_images) == 1
+            else (docker_image if executor == "docker" else None)
+        ),
         "context_strategy": context_strategy,
         "context_budget_chars": context_budget_chars,
         "run_id": suite_run_id,
@@ -419,7 +503,18 @@ def _run_suite(
         "failed_cases": failed_cases,
         "success_rate": round(success_rate, 4),
         "success_rate_percent": round(success_rate * 100, 2),
+        "agent_completed_cases": agent_completed_cases,
+        "verification_passed_cases": verification_passed_cases,
+        "agent_duration_seconds": round(agent_duration_seconds, 3),
         "total_duration_seconds": total_duration_seconds,
+        "docker_command_count": docker_command_count,
+        "docker_failure_count": docker_failure_count,
+        "fallback_count": fallback_count,
+        "execution_locations": {
+            "agent_commands": "docker-container" if executor == "docker" else "host",
+            "baseline": "host",
+            "verification": "host",
+        },
         "context_characters": context_characters,
         "context_compactions": context_compactions,
         "compaction_before_characters": compaction_before_characters,
@@ -554,6 +649,8 @@ def _run_verification(
             "exit_code": completed.returncode,
             "timed_out": False,
             "duration_seconds": round(time.monotonic() - started_at, 3),
+            "execution_location": "host",
+            "command": _format_command(command),
             "stdout": completed.stdout.strip(),
             "stderr": completed.stderr.strip(),
         }
@@ -562,6 +659,8 @@ def _run_verification(
             "exit_code": 124,
             "timed_out": True,
             "duration_seconds": round(time.monotonic() - started_at, 3),
+            "execution_location": "host",
+            "command": _format_command(command),
             "stdout": _timeout_text(exc.stdout),
             "stderr": _timeout_text(exc.stderr),
         }
@@ -624,6 +723,12 @@ def _format_command(parts: list[str]) -> str:
     return shlex.join(parts)
 
 
+def _agent_test_command(executor: str, test_file: str) -> str:
+    if executor == "docker":
+        return shlex.join(["python", "-m", "unittest", "-q", Path(test_file).as_posix()])
+    return _format_command([sys.executable, "-m", "unittest", "-q", test_file])
+
+
 def _timeout_text(value: str | bytes | None) -> str:
     if value is None:
         return ""
@@ -653,6 +758,11 @@ def _summarize_trace(path: Path) -> dict[str, Any]:
     model_request_count = 0
     max_model_request_characters = 0
     total_model_request_characters = 0
+    executor: str | None = None
+    docker_image: str | None = None
+    docker_command_count = 0
+    docker_failure_count = 0
+    fallback_count = 0
     for event in events:
         if event.get("type") == "run_started":
             payload = event.get("payload", {})
@@ -667,6 +777,9 @@ def _summarize_trace(path: Path) -> dict[str, Any]:
                 "budget_chars": context_budget_chars,
             }
             completion["contract"] = payload.get("completion_contract")
+            recorded_executor = payload.get("executor")
+            if isinstance(recorded_executor, str) and recorded_executor:
+                executor = recorded_executor
         elif event.get("type") == "model_requested":
             model_request_count += 1
             payload = event.get("payload", {})
@@ -695,6 +808,22 @@ def _summarize_trace(path: Path) -> dict[str, Any]:
         elif event.get("type") == "tool_started":
             tool = str(event.get("payload", {}).get("tool", "unknown"))
             tool_calls[tool] = tool_calls.get(tool, 0) + 1
+        elif event.get("type") == "tool_finished":
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            metadata = payload.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if metadata.get("fallback") is True:
+                fallback_count += 1
+            if payload.get("tool") == "run_command" and metadata.get("executor") == "docker":
+                docker_command_count += 1
+                if payload.get("success") is not True:
+                    docker_failure_count += 1
+                recorded_image = metadata.get("docker_image")
+                if isinstance(recorded_image, str) and recorded_image:
+                    docker_image = recorded_image
         elif event.get("type") == "file_changed":
             changed = event.get("payload", {}).get("path")
             if changed and changed not in files_changed:
@@ -729,6 +858,11 @@ def _summarize_trace(path: Path) -> dict[str, Any]:
         "usage": usage,
         "context": context,
         "completion": completion,
+        "executor": executor,
+        "docker_image": docker_image,
+        "docker_command_count": docker_command_count,
+        "docker_failure_count": docker_failure_count,
+        "fallback_count": fallback_count,
         "context_budget_chars": context_budget_chars,
         "context_compactions": context_compactions,
         "compaction_before_characters": compaction_before_characters,
@@ -759,6 +893,11 @@ def _empty_trace_summary() -> dict[str, Any]:
         "usage": {},
         "context": context,
         "completion": {},
+        "executor": None,
+        "docker_image": None,
+        "docker_command_count": 0,
+        "docker_failure_count": 0,
+        "fallback_count": 0,
         "context_budget_chars": None,
         "context_compactions": 0,
         "compaction_before_characters": 0,
@@ -791,6 +930,16 @@ def _nonnegative_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return parsed if parsed >= 0 else 0
+
+
+def _nonnegative_number(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if parsed >= 0 else 0.0
 
 
 def _case_failure_reasons(
@@ -828,9 +977,12 @@ def _runner_failure_result(
     *,
     context_strategy: str = "search",
     context_budget_chars: int | None = None,
+    executor: str = "local",
+    docker_image: str | None = None,
 ) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     result_path = run_dir / "result.json"
+    selected_docker_image = docker_image if executor == "docker" else None
     reason = f"runner_error: {type(exc).__name__}: {exc}"
     criteria = {
         "baseline_bug_reproduced": False,
@@ -846,6 +998,8 @@ def _runner_failure_result(
         "title": case_name,
         "run_id": run_id,
         "mode": mode,
+        "executor": executor,
+        "docker_image": selected_docker_image,
         "context_strategy": context_strategy,
         "context_budget_chars": context_budget_chars,
         "context_compactions": 0,
@@ -854,6 +1008,12 @@ def _runner_failure_result(
         "model_request_count": 0,
         "max_model_request_characters": 0,
         "total_model_request_characters": 0,
+        "agent_completed": False,
+        "verification_passed": False,
+        "agent_duration_seconds": 0.0,
+        "docker_command_count": 0,
+        "docker_failure_count": 0,
+        "fallback_count": 0,
         "passed": False,
         "duration_seconds": duration_seconds,
         "criteria": criteria,
@@ -867,6 +1027,13 @@ def _runner_failure_result(
         },
         "baseline": {"exit_code": None},
         "verification": {"exit_code": None},
+        "execution": {
+            "agent_executor": executor,
+            "agent_command_location": "docker-container" if executor == "docker" else "host",
+            "baseline_location": "host",
+            "verification_location": "host",
+            "docker_image": selected_docker_image,
+        },
         "trace": _empty_trace_summary(),
         "workspace_changes": {
             "allowed_paths": None,
@@ -893,7 +1060,13 @@ def _suite_case_summary(case_name: str, result: dict[str, Any]) -> dict[str, Any
         "case_name": case_name,
         "benchmark_id": result.get("benchmark_id", case_name),
         "title": result.get("title", case_name),
+        "executor": result.get("executor", "local"),
+        "trace_executor": trace.get("executor"),
+        "docker_image": result.get("docker_image"),
         "passed": bool(result.get("passed")),
+        "agent_completed": bool(criteria.get("agent_completed")),
+        "verification_passed": bool(criteria.get("verification_passed")),
+        "agent_duration_seconds": result.get("agent", {}).get("duration_seconds", 0.0),
         "steps": trace.get("steps"),
         "duration_seconds": result.get("duration_seconds"),
         "context_budget_chars": result.get(
@@ -918,6 +1091,10 @@ def _suite_case_summary(case_name: str, result: dict[str, Any]) -> dict[str, Any
         "total_model_request_characters": trace.get(
             "total_model_request_characters", 0
         ),
+        "docker_command_count": trace.get("docker_command_count", 0),
+        "docker_failure_count": trace.get("docker_failure_count", 0),
+        "fallback_count": trace.get("fallback_count", 0),
+        "execution": dict(result.get("execution", {})),
         "files_changed": list(
             workspace_changes.get("changed_paths") or trace.get("files_changed", [])
         ),
@@ -935,11 +1112,17 @@ def _print_case_summary(result: dict[str, Any]) -> None:
     changes = result["workspace_changes"]
     print(
         f"[{status}] {result['benchmark_id']} ({result['mode']}, "
-        f"context={result.get('context_strategy', 'search')})"
+        f"context={result.get('context_strategy', 'search')}, "
+        f"executor={result.get('executor', 'local')})"
     )
     print(f"  初始 Bug 可复现: {criteria['baseline_bug_reproduced']}")
     print(f"  Agent 正常结束: {criteria['agent_completed']}")
     print(f"  最终验证通过: {criteria['verification_passed']}")
+    print(
+        "  执行位置: "
+        f"Agent={result.get('execution', {}).get('agent_command_location', 'host')} "
+        "baseline/verification=host"
+    )
     print(f"  受保护文件未变: {criteria['protected_files_unchanged']}")
     print(f"  改动路径合规: {criteria['allowed_changed_paths_respected']}")
     print(f"  工具调用: {trace.get('tool_calls', {})}")
@@ -962,7 +1145,8 @@ def _print_suite_summary(result: dict[str, Any]) -> None:
     status = "PASS" if result["passed"] else "FAIL"
     print(
         f"[{status}] suite {result['suite_id']} ({result['mode']}, "
-        f"context={result.get('context_strategy', 'search')}) "
+        f"context={result.get('context_strategy', 'search')}, "
+        f"executor={result.get('executor', 'local')}) "
         f"{result['passed_cases']}/{result['total_cases']} "
         f"({result['success_rate_percent']:.2f}%)"
     )
@@ -981,6 +1165,15 @@ def _print_suite_summary(result: dict[str, Any]) -> None:
         if item["failure_reasons"]:
             print(f"    原因: {'; '.join(item['failure_reasons'])}")
         print(f"    产物: {item['artifact_path']}")
+    print(
+        f"  Agent 完成/验证通过: {result.get('agent_completed_cases', 0)}/"
+        f"{result.get('verification_passed_cases', 0)}；"
+        f"Agent 耗时: {result.get('agent_duration_seconds', 0.0):.3f}s"
+    )
+    print(
+        f"  Docker 命令/失败/fallback: {result.get('docker_command_count', 0)}/"
+        f"{result.get('docker_failure_count', 0)}/{result.get('fallback_count', 0)}"
+    )
     print(f"  汇总工具调用: {result['tool_calls']}")
     print(f"  汇总首次上下文字符数: {result.get('context_characters', 0)}")
     print(
