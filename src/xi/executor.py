@@ -1,20 +1,22 @@
-"""Restricted local execution for Xi's built-in tools.
+"""Execution adapters for Xi's built-in tools.
 
-This module intentionally calls itself a *restricted executor*, not an OS
-sandbox.  It enforces a workspace path seam, bounded file/output sizes, and
-command timeouts.  A future Docker or OS-isolation adapter can satisfy the same
-``execute`` interface without changing the agent loop.
+The local adapter intentionally calls itself *restricted*, not an OS sandbox.
+The Docker adapter adds process isolation for shell commands while satisfying
+the same small ``execute`` interface, so the agent loop and policy remain
+independent from the selected execution backend.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 from typing import Any, Mapping
+from uuid import uuid4
 
 from .tools.base import ToolResult
 
@@ -32,6 +34,8 @@ class ExecutionLimits:
 
 class RestrictedLocalExecutor:
     """Execute the four built-in operations under a resolved workspace root."""
+
+    name = "local"
 
     def __init__(
         self,
@@ -326,11 +330,7 @@ class RestrictedLocalExecutor:
         cwd = self.resolve_path(str(arguments.get("cwd", ".")), allow_root=True)
         if not cwd.is_dir():
             return ToolResult(output=f"cwd 不是目录: {self.relative_path(cwd)}", success=False)
-        requested_timeout = arguments.get("timeout_seconds", self.limits.command_timeout_seconds)
-        try:
-            timeout = min(max(float(requested_timeout), 0.1), self.limits.command_timeout_seconds)
-        except (TypeError, ValueError):
-            timeout = self.limits.command_timeout_seconds
+        timeout = _command_timeout(arguments.get("timeout_seconds"), self.limits)
         env = _safe_environment()
         executable = "cmd.exe" if os.name == "nt" else "/bin/sh"
         if os.name == "nt":
@@ -383,6 +383,8 @@ class RestrictedLocalExecutor:
 
 class DryRunExecutor:
     """Read normally, but record mutations and commands without executing them."""
+
+    name = "dry-run"
 
     def __init__(self, workspace: str | Path, *, limits: ExecutionLimits | None = None) -> None:
         self._reader = RestrictedLocalExecutor(workspace, limits=limits)
@@ -447,6 +449,28 @@ def _safe_environment() -> dict[str, str]:
         if key.lower() in allowed_names:
             result[key] = value
     result.setdefault("PYTHONUNBUFFERED", "1")
+    return result
+
+
+def _docker_cli_environment() -> dict[str, str]:
+    """Return the narrow host environment needed by the Docker CLI.
+
+    Docker connection selectors are intentionally kept out of the shared
+    local-command environment.  They are host-side CLI configuration, not
+    variables that should change the default local executor's child process.
+    """
+
+    result = _safe_environment()
+    for name in (
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+    ):
+        value = os.environ.get(name)
+        if value:
+            result[name] = value
     return result
 
 
@@ -533,10 +557,329 @@ def _header_new_index(header: str | None, length: int) -> int:
     return length
 
 
+def _command_timeout(value: Any, limits: ExecutionLimits) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return limits.command_timeout_seconds
+    if not math.isfinite(timeout):
+        return limits.command_timeout_seconds
+    return min(max(timeout, 0.1), limits.command_timeout_seconds)
+
+
+def _as_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
+    stdout = _as_text(exc.stdout)
+    stderr = _as_text(exc.stderr)
+    if stderr:
+        return f"{stdout}\n[stderr]\n{stderr}" if stdout else f"[stderr]\n{stderr}"
+    return stdout
+
+
+class DockerExecutor(RestrictedLocalExecutor):
+    """Run shell commands in an isolated Docker container.
+
+    The executor deliberately keeps the same small ``ToolExecutor`` interface
+    as :class:`RestrictedLocalExecutor`.  File-oriented tools still use the
+    inherited workspace-checked implementation, while ``run_command`` is
+    executed by a short-lived Linux container with only the workspace mounted
+    read/write.  This is a v1 process-isolation seam; it does not claim to be
+    a complete host security boundary for a compromised Docker daemon.
+    """
+
+    name = "docker"
+    pids_limit = 256
+    memory_limit = "512m"
+    memory_swap_limit = "512m"
+    cpu_limit = "1.0"
+
+    def __init__(
+        self,
+        workspace: str | Path,
+        *,
+        image: str | None = None,
+        docker_binary: str = "docker",
+        limits: ExecutionLimits | None = None,
+        max_output_chars: int | None = None,
+        max_file_bytes: int | None = None,
+        command_timeout_seconds: float | None = None,
+        network_disabled: bool = True,
+        read_only_root: bool = True,
+        tmpfs_size: str = "64m",
+    ) -> None:
+        super().__init__(
+            workspace,
+            limits=limits,
+            max_output_chars=max_output_chars,
+            max_file_bytes=max_file_bytes,
+            command_timeout_seconds=command_timeout_seconds,
+        )
+        normalized_image = str(
+            image or os.getenv("XI_DOCKER_IMAGE") or "python:3.11-slim"
+        ).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/@:-]*", normalized_image):
+            raise ValueError("Docker image 名称包含不受支持的字符")
+        normalized_binary = str(docker_binary).strip()
+        if not normalized_binary:
+            raise ValueError("Docker CLI 路径不能为空")
+        normalized_tmpfs = str(tmpfs_size).strip().lower()
+        if not re.fullmatch(r"[0-9]+[kmgt]?", normalized_tmpfs):
+            raise ValueError("tmpfs 大小必须是数字加可选单位 k/m/g/t")
+        self.image = normalized_image
+        self.docker_binary = normalized_binary
+        self._docker_path = shutil.which(normalized_binary)
+        self.network_disabled = bool(network_disabled)
+        self.read_only_root = bool(read_only_root)
+        self.tmpfs_size = normalized_tmpfs
+
+    @property
+    def available(self) -> bool:
+        """Whether the configured Docker CLI can be resolved on this host."""
+
+        return self._docker_path is not None
+
+    @property
+    def availability_error(self) -> str | None:
+        if self.available:
+            return None
+        return (
+            f"找不到 Docker CLI: {self.docker_binary}；"
+            "请安装 Docker Desktop/Engine，或改用 --executor local"
+        )
+
+    def execute(self, tool_name: str, arguments: Mapping[str, Any]) -> ToolResult:
+        result = super().execute(tool_name, arguments)
+        if tool_name == "run_command":
+            audit = self._audit_metadata()
+            audit.update(result.metadata)
+            audit["executor"] = self.name
+            audit["docker_image"] = self.image
+            audit["fallback"] = False
+            result.metadata = audit
+        else:
+            result.metadata.setdefault("executor", self.name)
+            result.metadata.setdefault("execution_location", "host-workspace")
+        return result
+
+    def _run_command(self, arguments: Mapping[str, Any]) -> ToolResult:
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return ToolResult(
+                output="command 不能为空",
+                success=False,
+                error="command 不能为空",
+                metadata=self._audit_metadata(),
+            )
+        if not self.available:
+            return ToolResult(
+                output=self.availability_error or "Docker CLI 不可用",
+                success=False,
+                error="docker unavailable",
+                metadata=self._audit_metadata(),
+            )
+
+        try:
+            cwd = self.resolve_path(str(arguments.get("cwd", ".")), allow_root=True)
+        except WorkspaceViolation as exc:
+            return ToolResult(
+                output=str(exc),
+                success=False,
+                error=str(exc),
+                metadata=self._audit_metadata(),
+            )
+        if not cwd.is_dir():
+            relative = self.relative_path(cwd)
+            return ToolResult(
+                output=f"cwd 不是目录: {relative}",
+                success=False,
+                error="cwd is not a directory",
+                metadata=self._audit_metadata(cwd=relative),
+            )
+
+        timeout = _command_timeout(arguments.get("timeout_seconds"), self.limits)
+        relative_cwd = self.relative_path(cwd)
+        container_cwd = "/workspace" if relative_cwd == "." else f"/workspace/{relative_cwd}"
+        container_name = f"xi-exec-{uuid4().hex[:12]}"
+        docker_command = self._build_docker_command(
+            command,
+            container_cwd=container_cwd,
+            container_name=container_name,
+        )
+        environment = _docker_cli_environment()
+        try:
+            completed = subprocess.run(
+                docker_command,
+                cwd=str(self.workspace),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                env=environment,
+            )
+        except subprocess.TimeoutExpired as exc:
+            cleaned = self._remove_container(container_name, environment)
+            partial = _timeout_output(exc)
+            output, truncated = _limit_text(partial, self.limits.max_output_chars)
+            return ToolResult(
+                output=f"Docker 命令超时（{timeout:g}s）\n{output}" if output else f"Docker 命令超时（{timeout:g}s）",
+                success=False,
+                error="docker command timeout",
+                metadata=self._audit_metadata(
+                    container=container_name,
+                    cwd=relative_cwd,
+                    timeout=True,
+                    container_cleanup=cleaned,
+                    truncated=truncated,
+                ),
+            )
+        except KeyboardInterrupt:
+            self._remove_container(container_name, environment)
+            raise
+        except FileNotFoundError:
+            self._docker_path = None
+            return ToolResult(
+                output=self.availability_error or "Docker CLI 不可用",
+                success=False,
+                error="docker unavailable",
+                metadata=self._audit_metadata(),
+            )
+        except OSError as exc:
+            return ToolResult(
+                output=f"Docker 执行失败: {exc}",
+                success=False,
+                error=str(exc),
+                metadata=self._audit_metadata(
+                    container=container_name,
+                    cwd=relative_cwd,
+                ),
+            )
+
+        stdout = _as_text(completed.stdout)
+        stderr = _as_text(completed.stderr)
+        combined = stdout
+        if stderr:
+            combined = f"{combined}\n[stderr]\n{stderr}" if combined else f"[stderr]\n{stderr}"
+        output, truncated = _limit_text(combined, self.limits.max_output_chars)
+        return ToolResult(
+            output=output or "(命令无输出)",
+            success=completed.returncode == 0,
+            error=None if completed.returncode == 0 else f"docker exit code {completed.returncode}",
+            metadata=self._audit_metadata(
+                container=container_name,
+                cwd=relative_cwd,
+                exit_code=completed.returncode,
+                truncated=truncated,
+            ),
+        )
+
+    def _audit_metadata(self, **extra: Any) -> dict[str, Any]:
+        """Describe the selected isolation policy on every Docker outcome."""
+
+        metadata: dict[str, Any] = {
+            "executor": self.name,
+            "execution_location": "docker-container",
+            "docker_image": self.image,
+            "entrypoint": "/bin/sh",
+            "network": "none" if self.network_disabled else "default",
+            "read_only_root": self.read_only_root,
+            "workspace_mount": "/workspace:rw",
+            "tmpfs": f"/tmp:rw,nosuid,nodev,size={self.tmpfs_size}",
+            "cap_drop": "ALL",
+            "no_new_privileges": True,
+            "pids_limit": self.pids_limit,
+            "memory_limit": self.memory_limit,
+            "memory_swap_limit": self.memory_swap_limit,
+            "cpu_limit": self.cpu_limit,
+            "command_timeout_limit_seconds": self.limits.command_timeout_seconds,
+            "fallback": False,
+        }
+        metadata.update(extra)
+        return metadata
+
+    def _build_docker_command(
+        self,
+        command: str,
+        *,
+        container_cwd: str,
+        container_name: str,
+    ) -> list[str]:
+        assert self._docker_path is not None
+        args = [
+            self._docker_path,
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+        ]
+        if self.network_disabled:
+            args.extend(["--network", "none"])
+        if self.read_only_root:
+            args.append("--read-only")
+        mount_source = self.workspace.as_posix() if os.name == "nt" else str(self.workspace)
+        args.extend(
+            [
+                "--mount",
+                f"type=bind,source={mount_source},target=/workspace",
+                "--tmpfs",
+                f"/tmp:rw,nosuid,nodev,size={self.tmpfs_size}",
+                "--workdir",
+                container_cwd,
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--pids-limit",
+                str(self.pids_limit),
+                "--memory",
+                self.memory_limit,
+                "--memory-swap",
+                self.memory_swap_limit,
+                "--cpus",
+                self.cpu_limit,
+                "--env",
+                "PYTHONUNBUFFERED=1",
+                "--env",
+                "PYTHONDONTWRITEBYTECODE=1",
+                "--entrypoint",
+                "/bin/sh",
+            ]
+        )
+        if os.name != "nt" and hasattr(os, "getuid") and hasattr(os, "getgid"):
+            args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+        args.extend([self.image, "-lc", command])
+        return args
+
+    def _remove_container(self, container_name: str, environment: Mapping[str, str]) -> bool:
+        if self._docker_path is None:
+            return False
+        try:
+            completed = subprocess.run(
+                [self._docker_path, "rm", "-f", container_name],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+                env=dict(environment),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0
+
+
 __all__ = [
     "ExecutionLimits",
     "WorkspaceViolation",
     "RestrictedLocalExecutor",
+    "DockerExecutor",
     "LocalExecutor",
     "DryRunExecutor",
 ]

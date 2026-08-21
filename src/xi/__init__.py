@@ -23,6 +23,7 @@ from .compaction import (
 )
 from .context import ContextBuilder, RepoMapContextBuilder, SearchContextBuilder
 from .events import Event, EventCollection, JsonlSessionStore, MemorySessionStore
+from .executor import DockerExecutor, DryRunExecutor, ExecutionLimits, RestrictedLocalExecutor
 from .models import ModelResponse, OpenAICompatibleModel, OpenAIModel, ScriptedModel, ToolCall
 from .runtime import AgentRuntime, RunResult
 from .session import RecoveryPoint, SessionProjection, SessionProjectionError, project_session
@@ -53,6 +54,10 @@ __all__ = [
     "EventCollection",
     "MemorySessionStore",
     "JsonlSessionStore",
+    "ExecutionLimits",
+    "RestrictedLocalExecutor",
+    "DockerExecutor",
+    "DryRunExecutor",
     "ModelResponse",
     "ToolCall",
     "ScriptedModel",

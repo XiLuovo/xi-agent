@@ -14,6 +14,7 @@ Xi 当前已经具备一个可运行、可研究的最小闭环：
 - 交互模式与一次性无交互（Headless）模式共用同一个 `AgentRuntime`；
 - 模型、工具、策略、执行器和 JSONL 会话存储都可以替换；
 - 支持代码搜索、文件读取、补丁修改和测试命令执行；
+- 支持受限本地执行与 Docker 隔离执行两种可替换后端；
 - 记录可审计的 JSONL 事件 Trace，并支持离线回放；
 - 支持从正常、失败或安全中断的 Trace 恢复上下文并继续执行；
 - 支持从历史成功 Run 的结束事件创建独立 Session 分支；
@@ -38,6 +39,7 @@ Copy-Item .env.example .env
 XI_API_KEY=你的_API_Key
 XI_MODEL=你的模型名称
 XI_BASE_URL=https://你的服务地址/v1
+XI_DOCKER_IMAGE=python:3.11-slim
 ```
 
 安装完成后，可以直接进入自然语言交互，或者执行一次性任务：
@@ -47,6 +49,7 @@ xi
 xi -p "修复这个 bug 并运行测试" --workspace .
 xi -p "修复固定 Bug" --allow-command "python -m pytest -q tests/test_bug.py"
 xi -p "定位跨文件调用链问题" --context-strategy repo-map
+xi -p "运行隔离测试" --executor docker --allow-command "python -m unittest -q"
 xi resume .xi\traces\20260820-120000-abcd1234.jsonl
 xi resume .xi\traces\20260820-120000-abcd1234.jsonl -p "继续检查刚才的修改"
 xi fork .xi\traces\20260820-120000-abcd1234.jsonl --at-event <run_finished事件ID>
@@ -165,8 +168,38 @@ Live Suite 会调用真实模型，本地确定性验证应使用 scripted。详
 
 ## 安全边界
 
-Xi 的本地执行器会约束工作目录、文件路径、超时和输出长度，但它不是 OS
-沙箱；不受信任任务应放入容器或其他隔离环境。
+Xi 将“是否允许工具调用”的 Policy 与“如何执行操作”的 Executor 分开。默认
+`--executor local` 使用受限本地执行器，约束工作目录、文件路径、超时、输出长度和
+传递给子进程的环境变量，但它不是 OS 沙箱。
+
+需要隔离命令进程时，可选择 Docker Executor：
+
+```powershell
+xi -p "运行项目测试并修复失败" `
+  --executor docker `
+  --docker-image python:3.11-slim `
+  --allow-command "python -m unittest -q"
+```
+
+Docker Executor v1 继续通过宿主机执行经过路径校验的 `read_file`、`search_code` 和
+`apply_patch`；风险最高的 `run_command` 会进入一次性 Linux 容器。容器默认断网，只把
+当前工作区挂载到 `/workspace`，根文件系统只读，使用独立 `/tmp`，移除 Linux
+capabilities、禁止提权，并限制 PID、内存和 CPU。宿主机 API Key 等敏感环境变量不会
+自动传入容器；但工作区本身会完整挂载，因此工作区内的 `.env` 等文件仍属于容器可见
+范围。容器命令仍先经过同一套 allow/ask/deny Policy，Runtime 和 Agent loop 不需要针对
+执行后端分叉。
+
+使用 Docker 后端需要 Docker Desktop/Engine 和一个包含任务依赖的 Linux 镜像。默认
+镜像为 `XI_DOCKER_IMAGE`，未配置时使用 `python:3.11-slim`；也可以通过
+`--docker-image` 覆盖（该选项必须与 `--executor docker` 同时使用）。Windows 上需要
+Docker Desktop 运行 Linux containers，并允许当前盘符/目录用于 bind mount；容器内工作区
+路径固定为 `/workspace`。命令应采用容器内可用的 POSIX 路径和工具，Windows `.venv`
+不能直接在 Linux 容器中使用。Docker CLI 或 daemon 不可用、工作区挂载失败、镜像缺失或
+容器执行失败时，Xi 会明确返回失败，**不会静默回退成本地执行**。
+
+`run_started.payload.executor` 会记录本轮选择的后端，Docker 命令的 `tool_finished`
+metadata 还会记录镜像、容器名、网络模式和资源限制结果，便于 Trace 审计。更完整的威胁
+模型见 [Docker Executor v1 设计](docs/design/docker-executor.md)。
 
 Headless 模式中，未知命令默认拒绝；固定评测请用 `--allow-command` 精确声明
 唯一测试命令。交互模式会对未知命令询问确认。
@@ -271,8 +304,8 @@ Replay 只读取并校验 JSONL，按原事件顺序输出紧凑时间线和运�
 ## 后续路线
 
 - 将 Session Fork 扩展到更多安全的历史节点；
-- 长会话上下文压缩策略与预算效果实验；
-- Docker Executor，进一步加强进程与文件系统隔离。
+- 为 Docker Executor 增加预构建依赖镜像和 local/docker 对照实验；
+- 在执行隔离稳定后探索 worktree 与后台任务。
 
 ## 许可证
 

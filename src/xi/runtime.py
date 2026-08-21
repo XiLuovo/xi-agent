@@ -27,7 +27,7 @@ from .executor import RestrictedLocalExecutor
 from .models import Model, ModelResponse, ToolCall
 from .policy import Decision, DefaultPolicy, Policy, PolicyContext, PolicyDecision
 from .session import SessionProjection
-from .tools import ToolRegistry, ToolResult, default_tools
+from .tools import ToolExecutor, ToolRegistry, ToolResult, default_tools
 
 
 @dataclass(slots=True)
@@ -57,7 +57,7 @@ class AgentRuntime:
         workspace: str | Path = ".",
         tools: ToolRegistry | Sequence[Any] | None = None,
         policy: Policy | None = None,
-        executor: Any | None = None,
+        executor: ToolExecutor | None = None,
         session_store: SessionStore | None = None,
         context_builder: ContextBuilder | None = None,
         completion_contract: CompletionContract | None = None,
@@ -271,6 +271,7 @@ class AgentRuntime:
         started_payload: dict[str, Any] = {
             "task": task,
             "workspace": str(self.workspace),
+            "executor": _executor_name(self.executor),
             "interactive": is_interactive,
             "max_steps": self.max_steps,
             "context_strategy": context_strategy,
@@ -769,6 +770,13 @@ def _completion_contract_name(contract: CompletionContract) -> str:
     if isinstance(name, str) and name.strip():
         return name.strip()
     return type(contract).__name__
+
+
+def _executor_name(executor: ToolExecutor) -> str:
+    name = getattr(executor, "name", None)
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return type(executor).__name__
 
 
 __all__ = ["AgentRuntime", "RunResult"]

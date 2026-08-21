@@ -71,12 +71,13 @@ except ImportError:  # pragma: no cover - exercised only in dependency-free inst
 from .completion import EvidenceCompletionContract
 from .context import RepoMapContextBuilder, SearchContextBuilder
 from .events import JsonlSessionStore
-from .executor import DryRunExecutor, RestrictedLocalExecutor
+from .executor import DockerExecutor, DryRunExecutor, RestrictedLocalExecutor
 from .models import OpenAICompatibleModel, ScriptedModel
 from .policy import DefaultPolicy
 from .replay import ReplayError, load_trace
 from .runtime import AgentRuntime
 from .session import SessionProjection, SessionProjectionError, project_session
+from .tools import ToolExecutor
 
 
 _console = Console()
@@ -140,6 +141,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-timeout", type=float, default=60.0)
     parser.add_argument("--command-timeout", type=float, default=30.0)
     parser.add_argument(
+        "--executor",
+        choices=("local", "docker"),
+        default="local",
+        help="命令执行后端：local 为受限本地进程；docker 为隔离容器",
+    )
+    parser.add_argument(
+        "--docker-image",
+        help="Docker Executor 镜像；默认 XI_DOCKER_IMAGE 或 python:3.11-slim",
+    )
+    parser.add_argument(
         "--allow-command",
         action="append",
         default=[],
@@ -170,6 +181,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.json = args.json or args.jsonl
     if args.context_budget_chars is not None and args.context_budget_chars <= 0:
         parser.error("--context-budget-chars 必须是正整数")
+    if args.dry_run and args.executor == "docker":
+        parser.error("--dry-run 与 --executor docker 不能同时使用")
+    if args.docker_image and args.executor != "docker":
+        parser.error("--docker-image 仅用于 --executor docker")
     if args.command != "fork" and args.at_event is not None:
         parser.error("--at-event 仅用于 xi fork")
     if args.command == "replay":
@@ -220,13 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     store = JsonlSessionStore(trace_path, on_append=on_append)
     try:
         model = _build_model(args)
-        if args.dry_run:
-            executor = DryRunExecutor(workspace)
-        else:
-            executor = RestrictedLocalExecutor(
-                workspace,
-                command_timeout_seconds=args.command_timeout,
-            )
+        executor = _build_executor(args, workspace)
         context_strategy = projection.context_strategy if projection is not None else args.context_strategy
         context_budget_chars = (
             args.context_budget_chars
@@ -366,6 +375,24 @@ def _build_model(args: argparse.Namespace):
         base_url=args.base_url,
         api_key=args.api_key,
         timeout_seconds=args.model_timeout,
+    )
+
+
+def _build_executor(args: argparse.Namespace, workspace: Path) -> ToolExecutor:
+    if args.dry_run:
+        return DryRunExecutor(workspace)
+    if args.executor == "docker":
+        executor = DockerExecutor(
+            workspace,
+            image=args.docker_image,
+            command_timeout_seconds=args.command_timeout,
+        )
+        if not executor.available:
+            raise RuntimeError(executor.availability_error or "Docker CLI 不可用")
+        return executor
+    return RestrictedLocalExecutor(
+        workspace,
+        command_timeout_seconds=args.command_timeout,
     )
 
 
