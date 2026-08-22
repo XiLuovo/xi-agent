@@ -27,6 +27,7 @@ from .executor import DockerExecutor, DryRunExecutor, ExecutionLimits, Restricte
 from .models import ModelResponse, OpenAICompatibleModel, OpenAIModel, ScriptedModel, ToolCall
 from .runtime import AgentRuntime, RunResult
 from .session import RecoveryPoint, SessionProjection, SessionProjectionError, project_session
+from .worktree import WorktreeCleanup, WorktreeError, WorktreeManager, WorktreeRecord
 
 __all__ = [
     "__version__",
@@ -63,4 +64,8 @@ __all__ = [
     "ScriptedModel",
     "OpenAICompatibleModel",
     "OpenAIModel",
+    "WorktreeCleanup",
+    "WorktreeError",
+    "WorktreeManager",
+    "WorktreeRecord",
 ]

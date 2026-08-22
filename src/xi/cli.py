@@ -70,7 +70,7 @@ except ImportError:  # pragma: no cover - exercised only in dependency-free inst
 
 from .completion import EvidenceCompletionContract
 from .context import RepoMapContextBuilder, SearchContextBuilder
-from .events import JsonlSessionStore
+from .events import Event, JsonlSessionStore
 from .executor import DockerExecutor, DryRunExecutor, RestrictedLocalExecutor
 from .models import OpenAICompatibleModel, ScriptedModel
 from .policy import DefaultPolicy
@@ -78,6 +78,7 @@ from .replay import ReplayError, load_trace
 from .runtime import AgentRuntime
 from .session import SessionProjection, SessionProjectionError, project_session
 from .tools import ToolExecutor
+from .worktree import WorktreeError, WorktreeManager
 
 
 _console = Console()
@@ -113,7 +114,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--prompt", help="一次性执行任务后退出（headless）")
     parser.add_argument(
         "--workspace",
-        help="受限工作区目录；普通运行默认当前目录，resume/fork 默认使用来源 trace 中记录的目录",
+        help="源 Git 仓库或受限工作区；普通运行默认当前目录，resume/fork 使用来源 trace 工作区",
+    )
+    parser.add_argument(
+        "--worktree",
+        action="store_true",
+        help="在源 Git 仓库的 detached 临时 worktree 中执行本轮任务",
+    )
+    parser.add_argument(
+        "--worktree-root",
+        help="临时 worktree 的显式根目录；默认源仓库父目录下的 .xi-worktrees",
+    )
+    parser.add_argument(
+        "--keep-worktree",
+        action="store_true",
+        help="任务结束后保留 worktree 供人工检查；默认自动回收",
     )
     parser.add_argument("--trace", help="JSONL trace 路径；默认写入 .xi/traces")
     parser.add_argument(
@@ -187,6 +202,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--docker-image 仅用于 --executor docker")
     if args.command != "fork" and args.at_event is not None:
         parser.error("--at-event 仅用于 xi fork")
+    if args.keep_worktree and not args.worktree:
+        parser.error("--keep-worktree 仅用于 --worktree")
+    if args.worktree_root and not args.worktree:
+        parser.error("--worktree-root 仅用于 --worktree")
+    if args.worktree and args.command in {"resume", "fork", "replay"}:
+        parser.error("--worktree 当前只支持新的普通任务，不支持 resume/fork/replay")
     if args.command == "replay":
         return _run_replay_command(parser, args)
     load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
@@ -208,32 +229,52 @@ def main(argv: Sequence[str] | None = None) -> int:
         prompt = _resolve_prompt(args)
     if args.json and prompt is None:
         parser.error("--json/--jsonl 仅用于一次性 headless 任务")
-    workspace = (
+    source_workspace = (
         projection.workspace
         if projection is not None and args.workspace is None
         else Path(args.workspace or ".").expanduser().resolve()
     )
-    if projection is not None and workspace != projection.workspace:
+    if projection is not None and source_workspace != projection.workspace:
         parser.error(
             f"{session_action} 必须使用来源 trace 中记录的工作区；当前为 "
-            f"{projection.workspace}"
+            f"{source_workspace}"
         )
-    if not workspace.exists() or not workspace.is_dir():
-        parser.error(f"工作区不是目录: {workspace}")
+    if not source_workspace.exists() or not source_workspace.is_dir():
+        parser.error(f"工作区不是目录: {source_workspace}")
+    worktree_manager: WorktreeManager | None = None
+    worktree_record = None
+    workspace = source_workspace
+    if args.worktree:
+        worktree_manager = WorktreeManager(
+            source_workspace,
+            root=args.worktree_root,
+            keep=args.keep_worktree,
+        )
+        try:
+            worktree_record = worktree_manager.create()
+        except WorktreeError as exc:
+            _error_console.print(Text(f"worktree 创建失败：{exc}", style="red"))
+            return 1
+        workspace = worktree_record.worktree_path
     if session_action == "resume" and projection is not None:
         trace_path = projection.source
     elif session_action == "fork" and projection is not None:
         trace_path = _resolve_fork_trace_path(parser, args.trace, workspace, projection)
     else:
-        trace_path = _resolve_trace_path(args.trace, workspace)
+        trace_path = _resolve_trace_path(
+            args.trace,
+            source_workspace if worktree_record is not None else workspace,
+        )
     if session_action == "resume" and projection is not None and args.trace is not None:
         requested_trace = Path(args.trace).expanduser().resolve()
         if requested_trace != projection.source:
             parser.error("resume 会继续写入原 trace，不能通过 --trace 改写到其他文件")
 
     on_append = _print_event if args.json else (_render_interactive_event if prompt is None else None)
-    store = JsonlSessionStore(trace_path, on_append=on_append)
+    store: JsonlSessionStore | None = None
+    exit_code = 1
     try:
+        store = JsonlSessionStore(trace_path, on_append=on_append)
         model = _build_model(args)
         executor = _build_executor(args, workspace)
         context_strategy = projection.context_strategy if projection is not None else args.context_strategy
@@ -267,6 +308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             auto_approve=args.auto_approve,
             approval_callback=_approval_prompt,
             context_budget_chars=context_budget_chars,
+            workspace_metadata=(worktree_record.summary() if worktree_record else None),
         )
         if session_action == "resume" and projection is not None:
             runtime.restore_session(projection)
@@ -281,11 +323,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.json:
                 _console.print(Text(result.text))
                 _error_console.print(Text(f"trace: {trace_path}", style="dim"))
-            return 0 if result.success else 1
-        return _interactive_loop(runtime, trace_path)
+            exit_code = 0 if result.success else 1
+        else:
+            exit_code = _interactive_loop(runtime, trace_path)
     except KeyboardInterrupt:
         _error_console.print("\n已退出。")
-        return 130
+        exit_code = 130
     except Exception as exc:
         if args.json:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False))
@@ -293,9 +336,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             message = Text("xi 启动失败：", style="red")
             message.append(str(exc))
             _error_console.print(message)
-        return 1
+        exit_code = 1
     finally:
-        store.close()
+        if worktree_manager is not None and worktree_record is not None:
+            try:
+                cleanup = worktree_manager.remove()
+                lifecycle_events = list(store.events) if store is not None else []
+                if lifecycle_events:
+                    last_event = lifecycle_events[-1]
+                    payload = worktree_record.summary()
+                    payload.update({"cleanup": cleanup.summary(), "state": cleanup.state})
+                    if store is not None:
+                        store.append(
+                            Event(
+                                type="worktree_removed",
+                                run_id=last_event.run_id,
+                                session_id=last_event.session_id,
+                                parent_id=last_event.event_id,
+                                payload=payload,
+                            )
+                        )
+                if cleanup.error:
+                    exit_code = 1
+                    _error_console.print(Text(f"worktree 回收失败：{cleanup.error}", style="red"))
+            except WorktreeError as exc:
+                exit_code = 1
+                _error_console.print(Text(f"worktree 生命周期失败：{exc}", style="red"))
+        if store is not None:
+            store.close()
+    return exit_code
 
 
 def _run_replay_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:

@@ -219,6 +219,32 @@ metadata 还会记录镜像、容器名、网络模式和资源限制结果，�
 Headless 模式中，未知命令默认拒绝；固定评测请用 `--allow-command` 精确声明
 唯一测试命令。交互模式会对未知命令询问确认。
 
+## 代码工作区隔离（Worktree）
+
+命令执行隔离和代码工作区隔离是两件事。需要让一次新任务在独立 Git 工作区中运行时，
+可显式启用 detached worktree：
+
+```powershell
+xi -p "修复 bug 并运行测试" --workspace . --worktree `
+  --worktree-root .xi\worktrees
+
+# 保留 worktree 供人工查看 diff；默认任务结束后自动回收
+xi -p "尝试另一种修复" --workspace . --worktree --keep-worktree
+```
+
+`--worktree` 只支持新的普通任务，当前明确拒绝与 `resume`、`fork`、`replay` 联用。
+Xi 从源仓库 `HEAD` 创建 detached worktree，让 AgentRuntime、Policy 和 local/Docker
+Executor 只看到新目录；源仓库不会被 Agent 修改。Trace 始终写在源仓库下的 `.xi`
+目录或显式 `--trace` 路径中，不会因默认清理 worktree 而丢失。`run_started` 会记录
+`workspace_mode`、源仓库、worktree 路径、base revision 和 cleanup policy，并追加
+`worktree_created` / `worktree_removed` 生命周期事件。
+
+默认 cleanup policy 是 `remove`，退出时会执行 `git worktree remove --force`；回收失败
+会明确报告并返回非零。使用 `--keep-worktree` 时目录会保留并记录 `retained`，用户需
+自行检查 diff、删除目录或执行 Git 的 worktree 清理。v1 不自动 commit、merge 或创建
+分支。Worktree 只隔离代码目录，不隔离进程、凭据或 Docker 容器；它不是安全沙箱。
+详细设计见 [Worktree Executor v1](docs/design/worktree-executor.md)。
+
 ## 会话续接与故障恢复（Resume / Recovery）
 
 CLI 统一使用 `xi resume`，但会根据 Trace 尾部自动区分两种领域行为：正常完成的

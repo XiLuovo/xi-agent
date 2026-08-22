@@ -70,6 +70,7 @@ class AgentRuntime:
         session_id: str | None = None,
         context_budget_chars: int | None = None,
         compactor: ContextCompactor | None = None,
+        workspace_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.workspace = Path(workspace).expanduser().resolve()
@@ -113,6 +114,8 @@ class AgentRuntime:
         else:
             self.context_budget_chars = None
         self.compactor = compactor if compactor is not None else DeterministicCompactor()
+        self.workspace_metadata = _json_safe(dict(workspace_metadata or {}))
+        self._worktree_created_emitted = False
         self._conversation: list[dict[str, Any]] = []
         self._session_id = session_id or uuid4().hex
         self._session_parent_id: str | None = None
@@ -281,6 +284,8 @@ class AgentRuntime:
                 is_session_run and self._conversation and not is_fork_run
             ),
         }
+        if self.workspace_metadata:
+            started_payload.update(self.workspace_metadata)
         if forked_from is not None:
             started_payload["forked_from"] = forked_from
         if recovered_from is not None:
@@ -292,6 +297,17 @@ class AgentRuntime:
             started_payload,
             parent_id=session_parent_id,
         )
+        lifecycle_event: Event | None = None
+        if (
+            self.workspace_metadata.get("workspace_mode") == "worktree"
+            and not self._worktree_created_emitted
+        ):
+            lifecycle_event = emit(
+                "worktree_created",
+                dict(self.workspace_metadata),
+                parent_id=started.event_id,
+            )
+            self._worktree_created_emitted = True
         if is_fork_run:
             self._forked_from = None
         if recovered_from is not None:
@@ -316,7 +332,7 @@ class AgentRuntime:
             final_text = ""
             total_usage: dict[str, Any] = {}
             execution_evidence: list[ToolExecutionEvidence] = []
-            turn_parent_id = started.event_id
+            turn_parent_id = lifecycle_event.event_id if lifecycle_event else started.event_id
 
             for step in range(1, self.max_steps + 1):
                 elapsed = time.monotonic() - started_at
